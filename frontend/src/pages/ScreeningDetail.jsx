@@ -11,27 +11,6 @@ function ScreeningDetail() {
   const [error, setError] = useState(null);
   const [expanded, setExpanded] = useState(null);
   const [tab, setTab] = useState('submissions');
-  const [uploading, setUploading] = useState({});
-
-  const handleUpload = async (bookingId, file) => {
-    setUploading(prev => ({ ...prev, [bookingId]: true }));
-    try {
-      const formData = new FormData();
-      formData.append('recording', file);
-      const res = await fetch(`${import.meta.env.VITE_API_URL}/api/bookings/${bookingId}/transcribe`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` },
-        body: formData
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Transcription failed');
-      setBookings(prev => prev.map(b => b.id === bookingId ? { ...b, transcript: data.transcript } : b));
-    } catch (e) {
-      alert('Transcription failed: ' + e.message);
-    } finally {
-      setUploading(prev => ({ ...prev, [bookingId]: false }));
-    }
-  };
 
   useEffect(() => {
     (async () => {
@@ -235,26 +214,13 @@ function ScreeningDetail() {
                       <div className="flex items-center gap-2 flex-shrink-0">
                         {b.meet_link && (
                           <a
-                            href={b.meet_link}
+                            href={`/meeting/${b.id}`}
                             target="_blank"
                             rel="noopener noreferrer"
                             className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-[#1a73e8] text-white hover:bg-[#1557b0] transition-colors whitespace-nowrap"
                           >
-                            Join Meeting
+                            Join &amp; Record
                           </a>
-                        )}
-                        {uploading[b.id] ? (
-                          <span className="text-xs text-slate-400 whitespace-nowrap">Transcribing…</span>
-                        ) : !b.transcript && (
-                          <label className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50 transition-colors whitespace-nowrap cursor-pointer">
-                            Upload Recording
-                            <input
-                              type="file"
-                              accept="audio/*,video/*,.mp4,.mp3,.wav,.m4a,.ogg,.webm"
-                              className="sr-only"
-                              onChange={(e) => e.target.files[0] && handleUpload(b.id, e.target.files[0])}
-                            />
-                          </label>
                         )}
                         <Link
                           to={`/screen/${role.url_slug}`}

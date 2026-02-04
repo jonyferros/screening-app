@@ -9,6 +9,7 @@ import Settings from './pages/Settings';
 import Success from './pages/Success';
 import Login from './pages/Login';
 import Register from './pages/Register';
+import MeetingRoom from './pages/MeetingRoom';
 
 function App() {
   const [user, setUser] = useState(() => localStorage.getItem('email'));
@@ -58,6 +59,7 @@ function App() {
           <Route path="/screenings/:roleId" element={user ? <ScreeningDetail /> : <Navigate to="/login" />} />
           <Route path="/create" element={user ? <CreateRole /> : <Navigate to="/login" />} />
           <Route path="/settings" element={user ? <Settings /> : <Navigate to="/login" />} />
+          <Route path="/meeting/:bookingId" element={user ? <MeetingRoom /> : <Navigate to="/login" />} />
           <Route path="/screen/:slug" element={<ScreeningForm />} />
           <Route path="/book/:slug" element={<BookingPage />} />
           <Route path="/success" element={<Success />} />

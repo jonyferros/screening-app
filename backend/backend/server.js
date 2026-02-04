@@ -908,6 +908,17 @@ app.get('/api/bookings/role/:roleId', verifyToken, async (req, res) => {
   }
 });
 
+// GET SINGLE BOOKING — auth
+app.get('/api/bookings/:id', verifyToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM bookings WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Booking not found' });
+    res.json({ booking: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // UPLOAD RECORDING & TRANSCRIBE — auth
 app.post('/api/bookings/:id/transcribe', verifyToken, upload.single('recording'), async (req, res) => {
   try {

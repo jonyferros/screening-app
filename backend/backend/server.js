@@ -256,7 +256,7 @@ app.use(express.json());
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bookings (
         id SERIAL PRIMARY KEY,
-        role_id INTEGER NOT NULL,
+        role_id TEXT NOT NULL,
         recruiter_email TEXT NOT NULL,
         candidate_name TEXT NOT NULL,
         candidate_email TEXT NOT NULL,
@@ -266,6 +266,8 @@ app.use(express.json());
         UNIQUE(recruiter_email, booked_date, booked_time)
       )
     `);
+    // Migrate role_id from INTEGER to TEXT if table already existed
+    await pool.query(`ALTER TABLE bookings ALTER COLUMN role_id TYPE TEXT`);
   } catch (e) {
     console.error('Failed during migration:', e.message);
   }

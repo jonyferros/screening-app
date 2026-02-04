@@ -97,10 +97,34 @@ function CreateRole() {
           </div>
 
           <div className="p-6 space-y-6">
-            {/* Shareable link */}
+            {/* Booking link (share with candidates) */}
             <div>
               <label className="block text-sm font-semibold text-slate-600 uppercase tracking-wide mb-2">
-                Shareable Link
+                Booking Link
+              </label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={`${window.location.origin}/book/${result.url_slug}`}
+                  readOnly
+                  className="flex-1 px-4 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm text-slate-700 font-mono"
+                />
+                <button
+                  onClick={() => {
+                    navigator.clipboard.writeText(`${window.location.origin}/book/${result.url_slug}`);
+                    alert('Copied!');
+                  }}
+                  className="px-5 py-2 bg-slate-900 text-white text-sm font-semibold rounded-lg hover:bg-slate-800 transition-colors"
+                >
+                  Copy
+                </button>
+              </div>
+            </div>
+
+            {/* Screening form link */}
+            <div>
+              <label className="block text-sm font-semibold text-slate-600 uppercase tracking-wide mb-2">
+                Screening Form
               </label>
               <div className="flex gap-2">
                 <input
@@ -114,7 +138,7 @@ function CreateRole() {
                     navigator.clipboard.writeText(result.screening_url);
                     alert('Copied!');
                   }}
-                  className="px-5 py-2 bg-slate-900 text-white text-sm font-semibold rounded-lg hover:bg-slate-800 transition-colors"
+                  className="px-5 py-2 border border-slate-300 text-slate-600 text-sm font-semibold rounded-lg hover:bg-slate-50 transition-colors"
                 >
                   Copy
                 </button>

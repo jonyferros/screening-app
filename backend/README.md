@@ -71,6 +71,28 @@ Tables are created / migrated automatically on startup.
 | `recruiter_email` | text | nullable |
 | `submitted_at` | timestamptz | Default `NOW()` |
 
+### `availability`
+| Column | Type | Notes |
+|---|---|---|
+| `user_email` | text PK | Recruiter email |
+| `days` | integer[] | Day indices Mon=0 … Sun=6 |
+| `start_hour` | integer | 0–23 |
+| `end_hour` | integer | 0–23 |
+
+### `bookings`
+| Column | Type | Notes |
+|---|---|---|
+| `id` | serial PK | |
+| `role_id` | int FK → roles | |
+| `recruiter_email` | text | Copied from role's `notification_email` |
+| `candidate_name` | text | |
+| `candidate_email` | text | |
+| `booked_date` | text | ISO date string `YYYY-MM-DD` |
+| `booked_time` | text | `HH:MM` |
+| `created_at` | timestamptz | Default `NOW()` |
+
+UNIQUE constraint on `(recruiter_email, booked_date, booked_time)` prevents double-booking.
+
 ## API Reference
 
 ### Auth
@@ -216,6 +238,43 @@ List all submissions for a given role, ordered newest first.
   "screenings": [ /* full row objects */ ]
 }
 ```
+
+### Availability
+
+#### `GET /api/availability` — *auth required*
+Returns the authenticated recruiter's availability settings.
+
+**Response:** `{ user_email, days: [0,1,2,3,4], start_hour: 9, end_hour: 17 }`
+
+#### `PUT /api/availability` — *auth required*
+Creates or updates availability. `days` is an array of day indices (Mon=0 … Sun=6).
+
+**Body:** `{ days: [0,1,2,3,4], start_hour: 9, end_hour: 17 }`
+**Response:** `{ status: "saved" }`
+
+### Bookings
+
+#### `GET /api/bookings/slots/:slug` — *public*
+Generates available 15-minute slots for the next 14 days based on the recruiter's availability. Excludes already-booked slots and past times on today.
+
+**Response:**
+```json
+{
+  "slots": [{ "date": "2026-02-05", "time": "09:00" }],
+  "role": { "company_name": "…", "job_title": "…" }
+}
+```
+
+#### `POST /api/bookings` — *public*
+Creates a booking. Returns 409 if the slot was taken (race condition handled by a DB UNIQUE constraint). Notifies the recruiter by email.
+
+**Body:** `{ slug, candidate_name, candidate_email, booked_date, booked_time }`
+**Response:** `{ booking: { id, role_id, recruiter_email, candidate_name, candidate_email, booked_date, booked_time, created_at } }`
+
+#### `GET /api/bookings/role/:roleId` — *auth required*
+Lists all bookings for a role, ordered by date then time.
+
+**Response:** `{ bookings: [ … ] }`
 
 ### Health
 

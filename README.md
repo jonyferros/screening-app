@@ -21,6 +21,8 @@ screening-app/
 │   │       ├── ScreeningDetail.jsx # Submissions for one role
 │   │       ├── CreateRole.jsx      # Create + edit a screening
 │   │       ├── ScreeningForm.jsx   # Public candidate form
+│   │       ├── BookingPage.jsx     # Public candidate booking page
+│   │       ├── Settings.jsx        # Recruiter availability settings
 │   │       └── Success.jsx         # Post-submission confirmation
 │   ├── package.json
 │   └── .env          # See frontend/README.md for required vars
@@ -64,22 +66,24 @@ Open **http://localhost:5173** — you will land on the login page.
 | Audience | Brand | Primary colour |
 |---|---|---|
 | Recruiter (login, dashboard, create) | Starcircle | `#001463` (navy) |
-| Candidate (screening form, success) | SquareMoon | `#0d1b2a` (deep navy) |
+| Candidate (screening form, booking, success) | SquareMoon | `#0d1b2a` (deep navy) |
 
 ## Auth
 
 - Only `@starcircle.com` email addresses can register.
 - JWTs are signed with `JWT_SECRET`, valid for 7 days.
-- The candidate-facing screening form (`/screen/:slug`) is fully public — no auth required. It includes a honeypot field and a math CAPTCHA to reduce spam.
+- The candidate-facing screening form (`/screen/:slug`) and booking page (`/book/:slug`) are fully public — no auth required. The screening form includes a honeypot field and a math CAPTCHA to reduce spam.
 
 ## How It Works
 
-1. A recruiter registers/logs in, creates a screening (company, job, questions).
-2. Claude generates additional questions and a role introduction.
-3. The recruiter receives a shareable link and a PDF report via email.
-4. A candidate opens the link, fills in the form, and submits.
-5. The recruiter receives a new PDF report with the candidate's answers via email.
-6. The recruiter can view all submissions in the dashboard and open/close screenings.
+1. A recruiter registers/logs in and sets their availability (days + hours) in Settings.
+2. The recruiter creates a screening (company, job, questions). Claude generates questions and a company + role introduction.
+3. The recruiter receives a booking link and a screening form link (plus a PDF report via email).
+4. The recruiter shares the booking link with candidates.
+5. A candidate opens the booking link, picks a date/time slot, and confirms. The recruiter is notified by email.
+6. After the call, the recruiter opens the screening form from the Bookings tab and fills in the candidate's details and answers.
+7. The recruiter receives a PDF report with the screening results via email.
+8. The recruiter can view all submissions and bookings in the dashboard and open/close screenings.
 
 ## Deployment Targets
 

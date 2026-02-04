@@ -148,9 +148,38 @@ function Screenings() {
                   )}
                 </div>
 
-                <span className="mt-2 inline-block text-xs text-blue-600 truncate max-w-sm">
-                  /screen/{role.url_slug}
-                </span>
+                <div className="mt-3 flex flex-col gap-1">
+                  <div className="flex items-center gap-2">
+                    <a
+                      href={`/book/${role.url_slug}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      onClick={(e) => e.stopPropagation()}
+                      className="text-xs text-blue-600 hover:text-blue-700 underline"
+                    >
+                      Book a call
+                    </a>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        navigator.clipboard.writeText(`${window.location.origin}/book/${role.url_slug}`);
+                      }}
+                      className="text-xs text-slate-400 hover:text-slate-600"
+                    >
+                      Copy
+                    </button>
+                  </div>
+                  <a
+                    href={`/screen/${role.url_slug}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(e) => e.stopPropagation()}
+                    className="text-xs text-slate-400 hover:text-slate-500 underline"
+                  >
+                    Screening form
+                  </a>
+                </div>
               </Link>
 
               {/* Close/Reopen button */}

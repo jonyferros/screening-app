@@ -26,7 +26,9 @@ npm run preview  # preview production build locally
 | `/` | Screenings | Yes | Dashboard — lists all roles with open/closed filter tabs and "new submission" badges |
 | `/create` | CreateRole | Yes | Create a new screening — fill in job details, select/add questions, AI generates the rest |
 | `/screenings/:roleId` | ScreeningDetail | Yes | View all candidate submissions for a given role (expandable cards) |
+| `/settings` | Settings | Yes | Recruiter availability — pick days and hours for booking slots |
 | `/screen/:slug` | ScreeningForm | — | Public candidate-facing screening form (SquareMoon branded, includes CAPTCHA) |
+| `/book/:slug` | BookingPage | — | Public candidate-facing booking page — pick a date/time slot for a screening call |
 | `/success` | Success | — | Confirmation page shown after a candidate submits |
 
 ## Auth Flow
@@ -47,7 +49,7 @@ npm run preview  # preview production build locally
 ### Candidate-facing (SquareMoon)
 - Header bar: deep navy `bg-[#0d1b2a]` with crescent moon SVG icon and "SquareMoon" text in white
 - Submit button: `bg-[#0d1b2a]`
-- Used on: ScreeningForm, Success
+- Used on: ScreeningForm, BookingPage, Success
 
 ## CAPTCHA (ScreeningForm)
 
@@ -62,19 +64,32 @@ No external CAPTCHA service is required.
 ### Screenings (Dashboard)
 - Fetches roles from `GET /api/roles?since=<lastLogin>`.
 - Displays open roles by default; toggle to the Closed tab to see closed ones.
-- Each card shows: job title, company, open/closed badge, total submission count, a blue "N new" badge if there are submissions since last visit, and the screening URL.
+- Each card shows: job title, company, open/closed badge, total submission count, a blue "N new" badge if there are submissions since last visit, a clickable "Book a call" link (with Copy button), and a "Screening form" link — both open in new tabs.
 - Clicking a card navigates to ScreeningDetail; the Close/Reopen button toggles status independently.
 - After roles load, `lastLogin` is updated so badges clear on next visit.
 
 ### CreateRole
 - Multi-step form: company name, job title, job description, preset + custom screening questions, then submit.
-- On success the backend returns AI-generated questions and intro — displayed in an editable result view with inline editing (pencil icon) for both the intro and individual questions.
+- On success the backend returns AI-generated questions and a company + role introduction — displayed in an editable result view with inline editing (pencil icon) for both the intro and individual questions.
+- The success view shows both the **Booking link** (primary, shared with candidates) and the **Screening form** link.
 - Edits are PATCHed to the backend immediately on save.
 
 ### ScreeningDetail
 - Receives role data via React Router location state (passed from the dashboard card).
-- Fetches submissions from `GET /api/screenings/role/:roleId`.
-- Each submission is a collapsible card: summary row with candidate name, email, salary, work preference, location, and date; expanded view adds visa status, availability, full Q&A, and recruiter notes.
+- Two tabs: **Submissions** and **Bookings**.
+- Fetches both submissions (`GET /api/screenings/role/:roleId`) and bookings (`GET /api/bookings/role/:roleId`) in parallel.
+- **Submissions tab:** Each submission is a collapsible card — summary row with candidate name, email, salary, work preference, location, and date; expanded view adds visa status, availability, full Q&A, and recruiter notes.
+- **Bookings tab:** Lists upcoming screening calls with candidate name, email, date/time, and a "Fill Screening" button that opens the screening form for that role.
+
+### Settings (Availability)
+- Recruiter sets which days of the week they are available and a daily start/end hour window.
+- Fetches current settings from `GET /api/availability`; saves via `PUT /api/availability`.
+- Displays a live slots-per-day calculation based on the current window.
+
+### BookingPage (Candidate)
+- Public, SquareMoon branded. Loads available slots from `GET /api/bookings/slots/:slug`.
+- Candidate enters name and email, picks a date, then a 15-minute time slot.
+- On submit (`POST /api/bookings`) shows a confirmation screen with date, time, and role.
 
 ### ScreeningForm (Candidate)
 - Loads role details by slug from `GET /api/roles/:slug`.

@@ -4,6 +4,8 @@ import Screenings from './pages/Screenings';
 import ScreeningDetail from './pages/ScreeningDetail';
 import CreateRole from './pages/CreateRole';
 import ScreeningForm from './pages/ScreeningForm';
+import BookingPage from './pages/BookingPage';
+import Settings from './pages/Settings';
 import Success from './pages/Success';
 import Login from './pages/Login';
 import Register from './pages/Register';
@@ -35,6 +37,7 @@ function App() {
               <div className="flex items-center gap-4">
                 <Link to="/" className="text-sm text-slate-600 hover:text-slate-800 font-medium transition-colors">My Screenings</Link>
                 <Link to="/create" className="text-sm text-slate-600 hover:text-slate-800 font-medium transition-colors">Create</Link>
+                <Link to="/settings" className="text-sm text-slate-600 hover:text-slate-800 font-medium transition-colors">Availability</Link>
                 <span className="text-slate-300">|</span>
                 <span className="text-sm text-slate-500">{user}</span>
                 <button
@@ -54,7 +57,9 @@ function App() {
           <Route path="/" element={user ? <Screenings /> : <Navigate to="/login" />} />
           <Route path="/screenings/:roleId" element={user ? <ScreeningDetail /> : <Navigate to="/login" />} />
           <Route path="/create" element={user ? <CreateRole /> : <Navigate to="/login" />} />
+          <Route path="/settings" element={user ? <Settings /> : <Navigate to="/login" />} />
           <Route path="/screen/:slug" element={<ScreeningForm />} />
+          <Route path="/book/:slug" element={<BookingPage />} />
           <Route path="/success" element={<Success />} />
         </Routes>
       </div>

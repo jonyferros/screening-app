@@ -244,6 +244,28 @@ app.use(express.json());
     `);
     // Add status column to roles if missing
     await pool.query(`ALTER TABLE roles ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'open'`);
+    // Availability + bookings
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS availability (
+        user_email TEXT PRIMARY KEY,
+        days INTEGER[] NOT NULL DEFAULT '{}',
+        start_hour INTEGER NOT NULL DEFAULT 9,
+        end_hour INTEGER NOT NULL DEFAULT 17
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bookings (
+        id SERIAL PRIMARY KEY,
+        role_id INTEGER NOT NULL,
+        recruiter_email TEXT NOT NULL,
+        candidate_name TEXT NOT NULL,
+        candidate_email TEXT NOT NULL,
+        booked_date TEXT NOT NULL,
+        booked_time TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(recruiter_email, booked_date, booked_time)
+      )
+    `);
   } catch (e) {
     console.error('Failed during migration:', e.message);
   }
@@ -346,7 +368,11 @@ Generate 6 screening questions. Keep them straightforward and easy to answer in 
     }
 
     prompt += `
-Also generate a 2-3 sentence role introduction that excites candidates.
+Also generate an introduction for the candidate. It should have two parts:
+1. A brief company overview (2-3 sentences about the company, inferred from the job description context — what they do, their mission, culture).
+2. A brief role overview (2-3 sentences about this specific position and what makes it exciting).
+
+Write both parts as flowing prose (no headings or labels), with the company overview first and the role overview second, separated by a paragraph break.
 
 Respond ONLY with valid JSON in this exact format:
 {
@@ -662,6 +688,165 @@ app.get('/api/screenings/role/:roleId', async (req, res) => {
 
   } catch (error) {
     console.error('Error fetching screenings:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// AVAILABILITY — get
+app.get('/api/availability', verifyToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM availability WHERE user_email = $1', [req.user.email]);
+    res.json(rows[0] || { user_email: req.user.email, days: [], start_hour: 9, end_hour: 17 });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// AVAILABILITY — save
+app.put('/api/availability', verifyToken, async (req, res) => {
+  try {
+    const { days, start_hour, end_hour } = req.body;
+    await pool.query(
+      `INSERT INTO availability (user_email, days, start_hour, end_hour)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (user_email) DO UPDATE SET days = EXCLUDED.days, start_hour = EXCLUDED.start_hour, end_hour = EXCLUDED.end_hour`,
+      [req.user.email, days, start_hour, end_hour]
+    );
+    res.json({ status: 'saved' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// BOOKING SLOTS — public, generates available 15-min slots for next 14 days
+app.get('/api/bookings/slots/:slug', async (req, res) => {
+  try {
+    const roleResult = await pool.query('SELECT * FROM roles WHERE url_slug = $1', [req.params.slug]);
+    if (roleResult.rows.length === 0) return res.status(404).json({ error: 'Role not found' });
+    const role = roleResult.rows[0];
+
+    const availResult = await pool.query('SELECT * FROM availability WHERE user_email = $1', [role.notification_email]);
+    if (availResult.rows.length === 0) {
+      return res.json({ slots: [], role: { company_name: role.company_name, job_title: role.job_title } });
+    }
+    const avail = availResult.rows[0];
+
+    // Collect date strings for next 14 days
+    const today = new Date();
+    const dateStrings = [];
+    for (let d = 0; d < 14; d++) {
+      const date = new Date(today);
+      date.setDate(today.getDate() + d);
+      dateStrings.push(date.toISOString().split('T')[0]);
+    }
+
+    // Fetch already-booked slots for this recruiter
+    const bookingsResult = await pool.query(
+      'SELECT booked_date, booked_time FROM bookings WHERE recruiter_email = $1 AND booked_date = ANY($2)',
+      [role.notification_email, dateStrings]
+    );
+    const bookedSet = new Set(bookingsResult.rows.map(b => `${b.booked_date}T${b.booked_time}`));
+
+    // Generate available slots
+    const now = new Date();
+    const slots = [];
+    for (let d = 0; d < 14; d++) {
+      const date = new Date(today);
+      date.setDate(today.getDate() + d);
+      const dayIndex = (date.getDay() + 6) % 7; // Mon=0 … Sun=6
+      if (!avail.days.includes(dayIndex)) continue;
+
+      const dateStr = dateStrings[d];
+      for (let h = avail.start_hour; h < avail.end_hour; h++) {
+        for (let m = 0; m < 60; m += 15) {
+          if (d === 0) {
+            const slotDate = new Date(today);
+            slotDate.setHours(h, m, 0, 0);
+            if (slotDate <= now) continue;
+          }
+          const time = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+          if (!bookedSet.has(`${dateStr}T${time}`)) {
+            slots.push({ date: dateStr, time });
+          }
+        }
+      }
+    }
+
+    res.json({ slots, role: { company_name: role.company_name, job_title: role.job_title } });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// CREATE BOOKING — public
+app.post('/api/bookings', async (req, res) => {
+  try {
+    const { slug, candidate_name, candidate_email, booked_date, booked_time } = req.body;
+    if (!slug || !candidate_name || !candidate_email || !booked_date || !booked_time) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+
+    const roleResult = await pool.query('SELECT * FROM roles WHERE url_slug = $1', [slug]);
+    if (roleResult.rows.length === 0) return res.status(404).json({ error: 'Role not found' });
+    const role = roleResult.rows[0];
+    if (role.status !== 'open') return res.status(400).json({ error: 'This screening is closed' });
+
+    const result = await pool.query(
+      `INSERT INTO bookings (role_id, recruiter_email, candidate_name, candidate_email, booked_date, booked_time)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [role.id, role.notification_email, candidate_name, candidate_email, booked_date, booked_time]
+    );
+
+    res.json({ booking: result.rows[0] });
+
+    // Fire-and-forget: notify recruiter
+    (async () => {
+      try {
+        const formattedDate = new Date(booked_date + 'T12:00:00').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+        await transporter.sendMail({
+          from: `"Screening Platform" <${process.env.SMTP_USER}>`,
+          to: role.notification_email,
+          subject: `New Booking — ${candidate_name} for ${role.job_title} at ${role.company_name}`,
+          html: `
+            <div style="font-family: system-ui, sans-serif; max-width: 560px; margin: 0 auto; padding: 32px 24px; color: #1E293B;">
+              <div style="border-top: 4px solid #0d1b2a; padding-top: 24px; margin-bottom: 24px;"></div>
+              <h1 style="font-size: 22px; margin: 0 0 4px;">New Screening Call Booked</h1>
+              <p style="color: #64748B; margin: 0 0 24px; font-size: 14px;">A candidate has scheduled a call.</p>
+              <div style="background: #F1F5F9; border-radius: 8px; padding: 16px 20px; margin-bottom: 24px;">
+                <p style="margin: 0 0 2px; font-size: 13px; color: #64748B; text-transform: uppercase; letter-spacing: 0.05em;">Candidate</p>
+                <p style="margin: 0 0 4px; font-size: 15px; font-weight: 600;">${candidate_name}</p>
+                <p style="margin: 0 0 12px; font-size: 13px; color: #2563EB;">${candidate_email}</p>
+                <p style="margin: 0 0 2px; font-size: 13px; color: #64748B; text-transform: uppercase; letter-spacing: 0.05em;">Role</p>
+                <p style="margin: 0 0 12px; font-size: 15px; font-weight: 600;">${role.job_title} at ${role.company_name}</p>
+                <p style="margin: 0 0 2px; font-size: 13px; color: #64748B; text-transform: uppercase; letter-spacing: 0.05em;">When</p>
+                <p style="margin: 0; font-size: 15px; font-weight: 600;">${formattedDate} at ${booked_time}</p>
+              </div>
+              <p style="font-size: 13px; color: #94A3B8; margin: 24px 0 0; border-top: 1px solid #E2E8F0; padding-top: 16px;">
+                Generated by Screening Platform.
+              </p>
+            </div>
+          `
+        });
+        console.log(`Booking notification sent to ${role.notification_email}`);
+      } catch (emailErr) {
+        console.error('Failed to send booking notification:', emailErr.message);
+      }
+    })();
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ error: 'That time slot is no longer available. Please pick another.' });
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET BOOKINGS FOR A ROLE — auth
+app.get('/api/bookings/role/:roleId', verifyToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM bookings WHERE role_id = $1 ORDER BY booked_date ASC, booked_time ASC',
+      [req.params.roleId]
+    );
+    res.json({ bookings: result.rows });
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });

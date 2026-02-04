@@ -231,7 +231,7 @@ function generateScreeningResultPDF({ company_name, job_title, screening, role_s
 app.use(cors({ origin: process.env.FRONTEND_URL }));
 app.use(express.json());
 
-// Ensure users table exists
+// Ensure tables exist / migrate
 (async () => {
   try {
     await pool.query(`
@@ -242,8 +242,10 @@ app.use(express.json());
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `);
+    // Add status column to roles if missing
+    await pool.query(`ALTER TABLE roles ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'open'`);
   } catch (e) {
-    console.error('Failed to create users table:', e.message);
+    console.error('Failed during migration:', e.message);
   }
 })();
 
@@ -316,7 +318,8 @@ app.post('/api/auth/login', async (req, res) => {
 // CREATE ROLE + GENERATE QUESTIONS
 app.post('/api/roles', verifyToken, async (req, res) => {
   try {
-    const { company_name, job_title, job_description, notification_email, selected_questions } = req.body;
+    const { company_name, job_title, job_description, selected_questions } = req.body;
+    const notification_email = req.user.email;
     const preSelected = Array.isArray(selected_questions) ? selected_questions : [];
     const remaining = Math.max(0, 6 - preSelected.length);
 
@@ -451,6 +454,28 @@ Respond ONLY with valid JSON in this exact format:
   }
 });
 
+// LIST ROLES FOR AUTHENTICATED USER
+app.get('/api/roles', verifyToken, async (req, res) => {
+  try {
+    const since = req.query.since ? new Date(req.query.since) : null;
+    const result = await pool.query(
+      `SELECT r.*,
+              COUNT(s.id)::int AS submission_count,
+              COUNT(CASE WHEN $2::timestamptz IS NULL OR s.submitted_at > $2::timestamptz THEN s.id END)::int AS new_submission_count
+       FROM roles r
+       LEFT JOIN screenings s ON s.role_id = r.id
+       WHERE r.notification_email = $1
+       GROUP BY r.id
+       ORDER BY r.id DESC`,
+      [req.user.email, since]
+    );
+    res.json({ roles: result.rows });
+  } catch (error) {
+    console.error('Error listing roles:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET ROLE BY SLUG
 app.get('/api/roles/:slug', async (req, res) => {
   try {
@@ -481,7 +506,7 @@ app.get('/api/roles/:slug', async (req, res) => {
 // UPDATE ROLE (intro / questions)
 app.patch('/api/roles/:id', verifyToken, async (req, res) => {
   try {
-    const { role_introduction, screening_questions } = req.body;
+    const { role_introduction, screening_questions, status } = req.body;
     const sets = [];
     const values = [];
     let idx = 1;
@@ -493,6 +518,10 @@ app.patch('/api/roles/:id', verifyToken, async (req, res) => {
     if (screening_questions !== undefined) {
       sets.push(`screening_questions = $${idx++}`);
       values.push(JSON.stringify(screening_questions));
+    }
+    if (status !== undefined) {
+      sets.push(`status = $${idx++}`);
+      values.push(status);
     }
 
     if (sets.length === 0) return res.status(400).json({ error: 'Nothing to update' });

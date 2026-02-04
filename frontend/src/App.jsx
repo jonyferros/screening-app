@@ -1,5 +1,7 @@
 import { useState } from 'react';
 import { BrowserRouter, Routes, Route, Link, Navigate } from 'react-router-dom';
+import Screenings from './pages/Screenings';
+import ScreeningDetail from './pages/ScreeningDetail';
 import CreateRole from './pages/CreateRole';
 import ScreeningForm from './pages/ScreeningForm';
 import Success from './pages/Success';
@@ -31,6 +33,9 @@ function App() {
                 <Link to="/" className="text-lg font-bold text-slate-800 tracking-tight">starcircle</Link>
               </div>
               <div className="flex items-center gap-4">
+                <Link to="/" className="text-sm text-slate-600 hover:text-slate-800 font-medium transition-colors">My Screenings</Link>
+                <Link to="/create" className="text-sm text-slate-600 hover:text-slate-800 font-medium transition-colors">Create</Link>
+                <span className="text-slate-300">|</span>
                 <span className="text-sm text-slate-500">{user}</span>
                 <button
                   onClick={handleLogout}
@@ -46,7 +51,9 @@ function App() {
         <Routes>
           <Route path="/login" element={user ? <Navigate to="/" /> : <Login onLogin={handleLogin} />} />
           <Route path="/register" element={user ? <Navigate to="/" /> : <Register onLogin={handleLogin} />} />
-          <Route path="/" element={user ? <CreateRole /> : <Navigate to="/login" />} />
+          <Route path="/" element={user ? <Screenings /> : <Navigate to="/login" />} />
+          <Route path="/screenings/:roleId" element={user ? <ScreeningDetail /> : <Navigate to="/login" />} />
+          <Route path="/create" element={user ? <CreateRole /> : <Navigate to="/login" />} />
           <Route path="/screen/:slug" element={<ScreeningForm />} />
           <Route path="/success" element={<Success />} />
         </Routes>

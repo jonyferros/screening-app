@@ -28,6 +28,7 @@ function Login({ onLogin }) {
 
       localStorage.setItem('token', data.token);
       localStorage.setItem('email', data.email);
+      localStorage.setItem('lastLogin', new Date().toISOString());
       onLogin(data.email);
       navigate('/');
     } catch {

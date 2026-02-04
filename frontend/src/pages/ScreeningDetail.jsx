@@ -210,12 +210,24 @@ function ScreeningDetail() {
                         <span className="text-xs text-slate-500">15 min</span>
                       </div>
                     </div>
-                    <Link
-                      to={`/screen/${role.url_slug}`}
-                      className="flex-shrink-0 text-xs font-semibold px-3 py-1.5 rounded-lg border border-slate-900 text-slate-900 hover:bg-slate-50 transition-colors whitespace-nowrap"
-                    >
-                      Fill Screening
-                    </Link>
+                    <div className="flex items-center gap-2 flex-shrink-0">
+                      {b.meet_link && (
+                        <a
+                          href={b.meet_link}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-[#1a73e8] text-white hover:bg-[#1557b0] transition-colors whitespace-nowrap"
+                        >
+                          Google Meet
+                        </a>
+                      )}
+                      <Link
+                        to={`/screen/${role.url_slug}`}
+                        className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-slate-900 text-slate-900 hover:bg-slate-50 transition-colors whitespace-nowrap"
+                      >
+                        Fill Screening
+                      </Link>
+                    </div>
                   </div>
                 );
               })}

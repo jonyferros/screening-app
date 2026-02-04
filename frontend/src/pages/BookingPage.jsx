@@ -86,7 +86,7 @@ function BookingPage() {
           </div>
           <h1 className="text-2xl font-bold text-slate-800 mb-2">Call Booked</h1>
           <p className="text-slate-500 text-sm mb-8">Your screening call has been scheduled. You will be contacted shortly.</p>
-          <div className="bg-slate-50 border border-slate-200 rounded-xl px-6 py-5 text-left inline-block">
+          <div className="bg-slate-50 border border-slate-200 rounded-xl px-6 py-5 text-left inline-block mb-6">
             {[
               { label: 'Date', value: formatDateLong(booking.booked_date) },
               { label: 'Time', value: `${booking.booked_time} (15 min)` },
@@ -98,6 +98,19 @@ function BookingPage() {
               </div>
             ))}
           </div>
+          {booking.meet_link && (
+            <div>
+              <a
+                href={booking.meet_link}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-2 bg-[#1a73e8] text-white px-6 py-3 rounded-lg font-semibold text-sm hover:bg-[#1557b0] transition-colors"
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="23 7 16 12 23 17 23 7" /><rect x="1" y="5" width="15" height="14" rx="2" ry="2" /></svg>
+                Join Google Meet
+              </a>
+            </div>
+          )}
         </div>
       </div>
     );

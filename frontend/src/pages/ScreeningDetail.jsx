@@ -11,6 +11,27 @@ function ScreeningDetail() {
   const [error, setError] = useState(null);
   const [expanded, setExpanded] = useState(null);
   const [tab, setTab] = useState('submissions');
+  const [uploading, setUploading] = useState({});
+
+  const handleUpload = async (bookingId, file) => {
+    setUploading(prev => ({ ...prev, [bookingId]: true }));
+    try {
+      const formData = new FormData();
+      formData.append('recording', file);
+      const res = await fetch(`${import.meta.env.VITE_API_URL}/api/bookings/${bookingId}/transcribe`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` },
+        body: formData
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Transcription failed');
+      setBookings(prev => prev.map(b => b.id === bookingId ? { ...b, transcript: data.transcript } : b));
+    } catch (e) {
+      alert('Transcription failed: ' + e.message);
+    } finally {
+      setUploading(prev => ({ ...prev, [bookingId]: false }));
+    }
+  };
 
   useEffect(() => {
     (async () => {
@@ -199,35 +220,56 @@ function ScreeningDetail() {
               {bookings.map((b) => {
                 const dateStr = new Date(b.booked_date + 'T12:00:00').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
                 return (
-                  <div key={b.id} className="bg-white border border-slate-200 rounded-xl shadow-sm px-5 py-4 flex items-start justify-between gap-4">
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <span className="text-sm font-semibold text-slate-800">{b.candidate_name}</span>
-                        <span className="text-xs text-slate-400">{b.candidate_email}</span>
+                  <div key={b.id} className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+                    <div className="px-5 py-4 flex items-start justify-between gap-4">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="text-sm font-semibold text-slate-800">{b.candidate_name}</span>
+                          <span className="text-xs text-slate-400">{b.candidate_email}</span>
+                        </div>
+                        <div className="flex items-center gap-3 mt-1.5 flex-wrap">
+                          <span className="text-xs text-slate-500">{dateStr} at {b.booked_time}</span>
+                          <span className="text-xs text-slate-500">15 min</span>
+                        </div>
                       </div>
-                      <div className="flex items-center gap-3 mt-1.5 flex-wrap">
-                        <span className="text-xs text-slate-500">{dateStr} at {b.booked_time}</span>
-                        <span className="text-xs text-slate-500">15 min</span>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2 flex-shrink-0">
-                      {b.meet_link && (
-                        <a
-                          href={b.meet_link}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-[#1a73e8] text-white hover:bg-[#1557b0] transition-colors whitespace-nowrap"
+                      <div className="flex items-center gap-2 flex-shrink-0">
+                        {b.meet_link && (
+                          <a
+                            href={b.meet_link}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-[#1a73e8] text-white hover:bg-[#1557b0] transition-colors whitespace-nowrap"
+                          >
+                            Join Meeting
+                          </a>
+                        )}
+                        {uploading[b.id] ? (
+                          <span className="text-xs text-slate-400 whitespace-nowrap">Transcribing…</span>
+                        ) : !b.transcript && (
+                          <label className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50 transition-colors whitespace-nowrap cursor-pointer">
+                            Upload Recording
+                            <input
+                              type="file"
+                              accept="audio/*,video/*,.mp4,.mp3,.wav,.m4a,.ogg,.webm"
+                              className="sr-only"
+                              onChange={(e) => e.target.files[0] && handleUpload(b.id, e.target.files[0])}
+                            />
+                          </label>
+                        )}
+                        <Link
+                          to={`/screen/${role.url_slug}`}
+                          className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-slate-900 text-slate-900 hover:bg-slate-50 transition-colors whitespace-nowrap"
                         >
-                          Join Meeting
-                        </a>
-                      )}
-                      <Link
-                        to={`/screen/${role.url_slug}`}
-                        className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-slate-900 text-slate-900 hover:bg-slate-50 transition-colors whitespace-nowrap"
-                      >
-                        Fill Screening
-                      </Link>
+                          Fill Screening
+                        </Link>
+                      </div>
                     </div>
+                    {b.transcript && (
+                      <div className="border-t border-slate-100 px-5 py-4">
+                        <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Transcript</p>
+                        <p className="text-sm text-slate-700 leading-relaxed">{b.transcript}</p>
+                      </div>
+                    )}
                   </div>
                 );
               })}

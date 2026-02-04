@@ -218,7 +218,7 @@ function ScreeningDetail() {
                           rel="noopener noreferrer"
                           className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-[#1a73e8] text-white hover:bg-[#1557b0] transition-colors whitespace-nowrap"
                         >
-                          Google Meet
+                          Join Meeting
                         </a>
                       )}
                       <Link

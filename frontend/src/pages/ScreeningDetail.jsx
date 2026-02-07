@@ -4,7 +4,7 @@ import { useParams, useLocation, Link } from 'react-router-dom';
 function ScreeningDetail() {
   const { roleId } = useParams();
   const location = useLocation();
-  const role = location.state?.role;
+  const [role, setRole] = useState(location.state?.role || null);
   const [submissions, setSubmissions] = useState([]);
   const [bookings, setBookings] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -16,6 +16,17 @@ function ScreeningDetail() {
     (async () => {
       try {
         const headers = { 'Authorization': `Bearer ${localStorage.getItem('token')}` };
+
+        // Fetch role if not passed via state
+        let currentRole = role;
+        if (!currentRole) {
+          const roleRes = await fetch(`${import.meta.env.VITE_API_URL}/api/roles/${roleId}`, { headers });
+          const roleData = await roleRes.json();
+          if (!roleRes.ok) throw new Error(roleData.error || 'Role not found');
+          currentRole = roleData.role;
+          setRole(currentRole);
+        }
+
         const [subsRes, bookRes] = await Promise.all([
           fetch(`${import.meta.env.VITE_API_URL}/api/screenings/role/${roleId}`, { headers }),
           fetch(`${import.meta.env.VITE_API_URL}/api/bookings/role/${roleId}`, { headers })
@@ -33,11 +44,19 @@ function ScreeningDetail() {
     })();
   }, [roleId]);
 
-  if (!role) {
+  if (loading) {
     return (
       <div className="max-w-3xl mx-auto px-4 py-16 text-center">
-        <p className="text-slate-400 text-sm mb-3">Role not found.</p>
-        <Link to="/" className="text-blue-600 text-sm hover:text-blue-700">Back to screenings</Link>
+        <p className="text-slate-400 text-sm">Loading…</p>
+      </div>
+    );
+  }
+
+  if (error || !role) {
+    return (
+      <div className="max-w-3xl mx-auto px-4 py-16 text-center">
+        <p className="text-slate-400 text-sm mb-3">{error || 'Role not found.'}</p>
+        <Link to="/" className="text-blue-600 text-sm hover:text-blue-700">Back to projects</Link>
       </div>
     );
   }
@@ -92,16 +111,9 @@ function ScreeningDetail() {
         ))}
       </div>
 
-      {loading && (
-        <p className="text-slate-400 text-sm py-8 text-center">Loading…</p>
-      )}
-
-      {error && (
-        <p className="text-red-600 text-sm py-8 text-center">{error}</p>
-      )}
 
       {/* Submissions tab */}
-      {!loading && !error && tab === 'submissions' && (
+      {tab === 'submissions' && (
         <>
           {submissions.length === 0 ? (
             <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-10 text-center">
@@ -188,7 +200,7 @@ function ScreeningDetail() {
       )}
 
       {/* Bookings tab */}
-      {!loading && !error && tab === 'bookings' && (
+      {tab === 'bookings' && (
         <>
           {bookings.length === 0 ? (
             <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-10 text-center">

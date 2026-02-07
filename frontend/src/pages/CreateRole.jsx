@@ -93,7 +93,7 @@ function CreateRole() {
             <div className="w-9 h-9 bg-green-600 rounded-full flex items-center justify-center flex-shrink-0">
               <span className="text-white font-bold">✓</span>
             </div>
-            <h2 className="text-lg font-semibold text-green-800">Screening Created Successfully</h2>
+            <h2 className="text-lg font-semibold text-green-800">Screening Template Created</h2>
           </div>
 
           <div className="p-6 space-y-6">
@@ -251,7 +251,7 @@ function CreateRole() {
   return (
     <div className="max-w-2xl mx-auto px-4 py-10">
       <div className="mb-8 text-center">
-        <h1 className="text-3xl font-bold text-slate-800">Create a Screening</h1>
+        <h1 className="text-3xl font-bold text-slate-800">Create a Screening Template</h1>
         <p className="text-slate-500 mt-1.5">Paste a job description and we'll generate screening questions.</p>
       </div>
 

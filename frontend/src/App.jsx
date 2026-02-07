@@ -8,18 +8,33 @@ import BookingPage from './pages/BookingPage';
 import Settings from './pages/Settings';
 import Success from './pages/Success';
 import Login from './pages/Login';
-import Register from './pages/Register';
+// Register removed - invite only system
 import MeetingRoom from './pages/MeetingRoom';
+import OutreachDashboard from './pages/OutreachDashboard';
+import OutreachRoleDetail from './pages/OutreachRoleDetail';
+import CandidateUpload from './pages/CandidateUpload';
+import OutreachThankYou from './pages/OutreachThankYou';
+import OutreachSequenceEditor from './pages/OutreachSequenceEditor';
+import AdminUsers from './pages/AdminUsers';
+import LinkedInQueue from './pages/LinkedInQueue';
+import Reports from './pages/Reports';
 
 function App() {
   const [user, setUser] = useState(() => localStorage.getItem('email'));
+  const [isAdmin, setIsAdmin] = useState(() => localStorage.getItem('isAdmin') === 'true');
 
-  const handleLogin = (email) => setUser(email);
+  const handleLogin = (email, admin = false) => {
+    setUser(email);
+    setIsAdmin(admin);
+    localStorage.setItem('isAdmin', admin ? 'true' : 'false');
+  };
 
   const handleLogout = () => {
     localStorage.removeItem('token');
     localStorage.removeItem('email');
+    localStorage.removeItem('isAdmin');
     setUser(null);
+    setIsAdmin(false);
   };
 
   return (
@@ -36,9 +51,14 @@ function App() {
                 <Link to="/" className="text-lg font-bold text-slate-800 tracking-tight">starcircle</Link>
               </div>
               <div className="flex items-center gap-4">
-                <Link to="/" className="text-sm text-slate-600 hover:text-slate-800 font-medium transition-colors">My Screenings</Link>
+                <Link to="/" className="text-sm text-slate-600 hover:text-slate-800 font-medium transition-colors">My Projects</Link>
+                <Link to="/outreach" className="text-sm text-slate-600 hover:text-slate-800 font-medium transition-colors">Outreach</Link>
+                <Link to="/reports" className="text-sm text-slate-600 hover:text-slate-800 font-medium transition-colors">Reports</Link>
                 <Link to="/create" className="text-sm text-slate-600 hover:text-slate-800 font-medium transition-colors">Create</Link>
-                <Link to="/settings" className="text-sm text-slate-600 hover:text-slate-800 font-medium transition-colors">Availability</Link>
+                <Link to="/settings" className="text-sm text-slate-600 hover:text-slate-800 font-medium transition-colors">Settings</Link>
+                {isAdmin && (
+                  <Link to="/admin/users" className="text-sm text-purple-600 hover:text-purple-800 font-medium transition-colors">Admin</Link>
+                )}
                 <span className="text-slate-300">|</span>
                 <span className="text-sm text-slate-500">{user}</span>
                 <button
@@ -54,15 +74,23 @@ function App() {
 
         <Routes>
           <Route path="/login" element={user ? <Navigate to="/" /> : <Login onLogin={handleLogin} />} />
-          <Route path="/register" element={user ? <Navigate to="/" /> : <Register onLogin={handleLogin} />} />
+          <Route path="/register" element={<Navigate to="/login" />} />
           <Route path="/" element={user ? <Screenings /> : <Navigate to="/login" />} />
           <Route path="/screenings/:roleId" element={user ? <ScreeningDetail /> : <Navigate to="/login" />} />
           <Route path="/create" element={user ? <CreateRole /> : <Navigate to="/login" />} />
           <Route path="/settings" element={user ? <Settings /> : <Navigate to="/login" />} />
           <Route path="/meeting/:bookingId" element={user ? <MeetingRoom /> : <Navigate to="/login" />} />
+          <Route path="/outreach" element={user ? <OutreachDashboard /> : <Navigate to="/login" />} />
+          <Route path="/outreach/:roleId" element={user ? <OutreachRoleDetail /> : <Navigate to="/login" />} />
+          <Route path="/outreach/:roleId/upload" element={user ? <CandidateUpload /> : <Navigate to="/login" />} />
+          <Route path="/outreach/:roleId/sequence" element={user ? <OutreachSequenceEditor /> : <Navigate to="/login" />} />
           <Route path="/screen/:slug" element={<ScreeningForm />} />
           <Route path="/book/:slug" element={<BookingPage />} />
           <Route path="/success" element={<Success />} />
+          <Route path="/outreach/thank-you" element={<OutreachThankYou />} />
+          <Route path="/admin/users" element={user && isAdmin ? <AdminUsers /> : <Navigate to="/" />} />
+          <Route path="/reports" element={user ? <Reports /> : <Navigate to="/login" />} />
+          <Route path="/linkedin-queue/:token" element={<LinkedInQueue />} />
         </Routes>
       </div>
     </BrowserRouter>

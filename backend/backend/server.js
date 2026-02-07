@@ -9,6 +9,9 @@ const PDFDocument = require('pdfkit');
 const nodemailer = require('nodemailer');
 const multer = require('multer');
 const OpenAI = require('openai');
+const { google } = require('googleapis');
+const cron = require('node-cron');
+const Papa = require('papaparse');
 require('dotenv').config();
 
 const app = express();
@@ -38,6 +41,20 @@ const transporter = nodemailer.createTransport({
 
 // Multer — in-memory storage, max 25 MB (Whisper limit)
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+
+// Google OAuth2 client for Gmail
+const oauth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3001/api/gmail/callback'
+);
+
+// Gmail scopes needed for sending and reading emails
+const GMAIL_SCOPES = [
+  'https://www.googleapis.com/auth/gmail.send',
+  'https://www.googleapis.com/auth/gmail.readonly',
+  'https://www.googleapis.com/auth/userinfo.email'
+];
 
 // Generate PDF report as a Buffer
 function generateReportPDF({ company_name, job_title, role_introduction, screening_questions, screening_url }) {
@@ -91,14 +108,7 @@ function generateReportPDF({ company_name, job_title, role_introduction, screeni
     // Questions list
     const questions = Array.isArray(screening_questions) ? screening_questions : JSON.parse(screening_questions);
     questions.forEach((q, i) => {
-      const qY = doc.y;
-      // Circle number badge
-      doc.save();
-      doc.fillColor(colors.blue).circle(62, qY + 8, 9).fill();
-      doc.fillColor(colors.white).fontSize(9).font('Helvetica-Bold').text(`${i + 1}`, { width: 18, align: 'center' });
-      doc.restore();
-      // Question text
-      doc.fontSize(10).fillColor(colors.navy).font('Helvetica').text(q, { x: 78, y: qY, width: contentWidth - 30, align: 'left' });
+      doc.fontSize(10).fillColor(colors.navy).font('Helvetica').text(`${i + 1}. ${q}`, { width: contentWidth, align: 'left' });
       doc.moveDown(0.6);
     });
 
@@ -194,17 +204,11 @@ function generateScreeningResultPDF({ company_name, job_title, screening, role_s
         doc.addPage();
         doc.y = 50;
       }
-      const qY = doc.y;
-      // Circle badge
-      doc.save();
-      doc.fillColor(colors.green).circle(62, qY + 8, 9).fill();
-      doc.fillColor(colors.white).fontSize(9).font('Helvetica-Bold').text(`${i + 1}`, { x: 55, y: qY + 3, width: 14, align: 'center' });
-      doc.restore();
       // Question
-      doc.fontSize(10).fillColor(colors.navy).font('Helvetica-Bold').text(qa.question, { x: 78, y: qY, width: contentWidth - 30 });
-      const ansY = doc.y + 2;
+      doc.fontSize(10).fillColor(colors.navy).font('Helvetica-Bold').text(`${i + 1}. ${qa.question}`, { width: contentWidth });
+      doc.moveDown(0.2);
       // Answer
-      doc.fontSize(10).fillColor(colors.gray).font('Helvetica').text(qa.answer || '—', { x: 78, y: ansY, width: contentWidth - 30 });
+      doc.fontSize(10).fillColor(colors.gray).font('Helvetica').text(qa.answer || '—', { width: contentWidth });
       doc.moveDown(0.8);
     });
 
@@ -244,9 +248,12 @@ app.use(express.json());
         id SERIAL PRIMARY KEY,
         email TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL,
+        is_admin BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `);
+    // Add is_admin column if missing
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE`);
     // Add status column to roles if missing
     await pool.query(`ALTER TABLE roles ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'open'`);
     // Availability + bookings
@@ -275,6 +282,182 @@ app.use(express.json());
     await pool.query(`ALTER TABLE bookings ALTER COLUMN role_id TYPE TEXT`);
     await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS meet_link TEXT`);
     await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS transcript TEXT`);
+
+    // ===== OUTREACH MODULE TABLES =====
+
+    // Gmail OAuth tokens per recruiter
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS gmail_oauth_tokens (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT UNIQUE NOT NULL,
+        access_token TEXT NOT NULL,
+        refresh_token TEXT NOT NULL,
+        token_expiry TIMESTAMPTZ NOT NULL,
+        gmail_address TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
+    // Candidates for outreach
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS outreach_candidates (
+        id SERIAL PRIMARY KEY,
+        role_id TEXT NOT NULL,
+        first_name TEXT NOT NULL,
+        last_name TEXT NOT NULL,
+        email TEXT NOT NULL,
+        country TEXT,
+        linkedin_url TEXT,
+        current_job_title TEXT,
+        current_employer TEXT,
+        status TEXT DEFAULT 'active' CHECK (status IN ('pending', 'active', 'interested', 'not_interested', 'responded', 'unsubscribed', 'gdpr_anonymized', 'linkedin_only')),
+        sequence_start_date DATE NOT NULL DEFAULT CURRENT_DATE,
+        interested_at TIMESTAMPTZ,
+        not_interested_at TIMESTAMPTZ,
+        responded_at TIMESTAMPTZ,
+        screening_link TEXT,
+        is_gdpr_country BOOLEAN DEFAULT FALSE,
+        gdpr_anonymized_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        created_by TEXT NOT NULL,
+        UNIQUE(role_id, email)
+      )
+    `);
+
+    // Update status constraint to include linkedin_only and make email nullable
+    await pool.query(`ALTER TABLE outreach_candidates ALTER COLUMN email DROP NOT NULL`).catch(() => {});
+    await pool.query(`ALTER TABLE outreach_candidates DROP CONSTRAINT IF EXISTS outreach_candidates_status_check`);
+    await pool.query(`ALTER TABLE outreach_candidates ADD CONSTRAINT outreach_candidates_status_check CHECK (status IN ('pending', 'active', 'interested', 'not_interested', 'responded', 'unsubscribed', 'gdpr_anonymized', 'linkedin_only'))`).catch(() => {});
+
+    // Individual emails in sequence
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS outreach_emails (
+        id SERIAL PRIMARY KEY,
+        candidate_id INTEGER NOT NULL REFERENCES outreach_candidates(id) ON DELETE CASCADE,
+        sequence_step INTEGER NOT NULL CHECK (sequence_step IN (1, 2, 3)),
+        subject TEXT NOT NULL,
+        body_html TEXT NOT NULL,
+        sent_at TIMESTAMPTZ,
+        scheduled_for DATE NOT NULL,
+        status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed', 'cancelled')),
+        open_count INTEGER DEFAULT 0,
+        first_opened_at TIMESTAMPTZ,
+        tracking_pixel_id TEXT UNIQUE,
+        gmail_message_id TEXT,
+        error_message TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
+    // CTA click responses
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS outreach_responses (
+        id SERIAL PRIMARY KEY,
+        candidate_id INTEGER NOT NULL REFERENCES outreach_candidates(id) ON DELETE CASCADE,
+        email_id INTEGER REFERENCES outreach_emails(id) ON DELETE SET NULL,
+        response_type TEXT NOT NULL CHECK (response_type IN ('interested', 'not_interested', 'email_reply', 'unsubscribe')),
+        responded_at TIMESTAMPTZ DEFAULT NOW(),
+        ip_address TEXT,
+        user_agent TEXT
+      )
+    `);
+
+    // Add reply_text column for storing email reply content
+    await pool.query(`ALTER TABLE outreach_responses ADD COLUMN IF NOT EXISTS reply_text TEXT`);
+    await pool.query(`ALTER TABLE outreach_responses ADD COLUMN IF NOT EXISTS sentiment TEXT`);
+    // Add gmail_thread_id to outreach_emails for reply tracking
+    await pool.query(`ALTER TABLE outreach_emails ADD COLUMN IF NOT EXISTS gmail_thread_id TEXT`);
+
+    // Analytics cache (refreshed periodically)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS outreach_analytics (
+        id SERIAL PRIMARY KEY,
+        role_id TEXT NOT NULL UNIQUE,
+        computed_at TIMESTAMPTZ DEFAULT NOW(),
+        total_candidates INTEGER DEFAULT 0,
+        step1_sent INTEGER DEFAULT 0,
+        step1_opened INTEGER DEFAULT 0,
+        step2_sent INTEGER DEFAULT 0,
+        step2_opened INTEGER DEFAULT 0,
+        step3_sent INTEGER DEFAULT 0,
+        step3_opened INTEGER DEFAULT 0,
+        total_interested INTEGER DEFAULT 0,
+        total_not_interested INTEGER DEFAULT 0,
+        total_responded INTEGER DEFAULT 0,
+        total_no_response INTEGER DEFAULT 0,
+        total_converted_to_screening INTEGER DEFAULT 0,
+        avg_response_time_hours NUMERIC
+      )
+    `);
+
+    // GDPR country reference
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS gdpr_countries (
+        country_code TEXT PRIMARY KEY,
+        country_name TEXT NOT NULL
+      )
+    `);
+
+    // Seed GDPR countries if empty
+    const gdprCheck = await pool.query('SELECT COUNT(*)::int AS count FROM gdpr_countries');
+    if (gdprCheck.rows[0].count === 0) {
+      await pool.query(`
+        INSERT INTO gdpr_countries (country_code, country_name) VALUES
+        ('AT', 'Austria'), ('BE', 'Belgium'), ('BG', 'Bulgaria'), ('HR', 'Croatia'),
+        ('CY', 'Cyprus'), ('CZ', 'Czech Republic'), ('DK', 'Denmark'), ('EE', 'Estonia'),
+        ('FI', 'Finland'), ('FR', 'France'), ('DE', 'Germany'), ('GR', 'Greece'),
+        ('HU', 'Hungary'), ('IE', 'Ireland'), ('IT', 'Italy'), ('LV', 'Latvia'),
+        ('LT', 'Lithuania'), ('LU', 'Luxembourg'), ('MT', 'Malta'), ('NL', 'Netherlands'),
+        ('PL', 'Poland'), ('PT', 'Portugal'), ('RO', 'Romania'), ('SK', 'Slovakia'),
+        ('SI', 'Slovenia'), ('ES', 'Spain'), ('SE', 'Sweden'),
+        ('IS', 'Iceland'), ('LI', 'Liechtenstein'), ('NO', 'Norway'),
+        ('GB', 'United Kingdom')
+        ON CONFLICT (country_code) DO NOTHING
+      `);
+      console.log('GDPR countries seeded');
+    }
+
+    // Outreach templates per role (editable sequence messages)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS outreach_templates (
+        id SERIAL PRIMARY KEY,
+        role_id TEXT NOT NULL,
+        sequence_step INTEGER NOT NULL CHECK (sequence_step IN (1, 2, 3)),
+        subject TEXT NOT NULL,
+        body_text TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(role_id, sequence_step)
+      )
+    `);
+
+    // Freelancer LinkedIn queue
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS linkedin_freelancer_queue (
+        id SERIAL PRIMARY KEY,
+        token TEXT UNIQUE NOT NULL,
+        role_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        expires_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '30 days'
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS linkedin_candidate_assignments (
+        id SERIAL PRIMARY KEY,
+        queue_id INTEGER NOT NULL REFERENCES linkedin_freelancer_queue(id),
+        candidate_id INTEGER NOT NULL REFERENCES outreach_candidates(id),
+        assigned_at TIMESTAMPTZ DEFAULT NOW(),
+        status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'contacted', 'interested', 'not_interested', 'no_response')),
+        updated_at TIMESTAMPTZ,
+        notes TEXT,
+        UNIQUE(queue_id, candidate_id)
+      )
+    `);
+
+    console.log('Outreach module tables ready');
   } catch (e) {
     console.error('Failed during migration:', e.message);
   }
@@ -339,8 +522,9 @@ app.post('/api/auth/login', async (req, res) => {
     const valid = await bcrypt.compare(password, rows[0].password);
     if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
 
-    const token = jwt.sign({ email }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token, email });
+    const isAdmin = rows[0].is_admin || false;
+    const token = jwt.sign({ email, isAdmin }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, email, isAdmin });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -380,6 +564,8 @@ Generate 6 screening questions. Keep them straightforward and easy to answer in 
 Also generate an introduction for the candidate. It should have two parts:
 1. A brief company overview (2-3 sentences about the company, inferred from the job description context — what they do, their mission, culture).
 2. A brief role overview (2-3 sentences about this specific position and what makes it exciting).
+
+IMPORTANT: Write in third person about the company (e.g., "The company specializes in..." or "${company_name} is a leading..."). Do NOT use first person ("we", "our") or second person ("you will join").
 
 Write both parts as flowing prose (no headings or labels), with the company overview first and the role overview second, separated by a paragraph break.
 
@@ -489,21 +675,37 @@ Respond ONLY with valid JSON in this exact format:
   }
 });
 
-// LIST ROLES FOR AUTHENTICATED USER
+// LIST ROLES FOR AUTHENTICATED USER (admins see all)
 app.get('/api/roles', verifyToken, async (req, res) => {
   try {
     const since = req.query.since ? new Date(req.query.since) : null;
-    const result = await pool.query(
-      `SELECT r.*,
+    const isAdmin = req.user.isAdmin || false;
+
+    let query, params;
+    if (isAdmin) {
+      // Admin sees all roles
+      query = `SELECT r.*,
+              COUNT(s.id)::int AS submission_count,
+              COUNT(CASE WHEN $1::timestamptz IS NULL OR s.submitted_at > $1::timestamptz THEN s.id END)::int AS new_submission_count
+       FROM roles r
+       LEFT JOIN screenings s ON s.role_id = r.id
+       GROUP BY r.id
+       ORDER BY r.id DESC`;
+      params = [since];
+    } else {
+      // Regular user sees only their roles
+      query = `SELECT r.*,
               COUNT(s.id)::int AS submission_count,
               COUNT(CASE WHEN $2::timestamptz IS NULL OR s.submitted_at > $2::timestamptz THEN s.id END)::int AS new_submission_count
        FROM roles r
        LEFT JOIN screenings s ON s.role_id = r.id
        WHERE r.notification_email = $1
        GROUP BY r.id
-       ORDER BY r.id DESC`,
-      [req.user.email, since]
-    );
+       ORDER BY r.id DESC`;
+      params = [req.user.email, since];
+    }
+
+    const result = await pool.query(query, params);
     res.json({ roles: result.rows });
   } catch (error) {
     console.error('Error listing roles:', error);
@@ -511,8 +713,8 @@ app.get('/api/roles', verifyToken, async (req, res) => {
   }
 });
 
-// GET ROLE BY SLUG
-app.get('/api/roles/:slug', async (req, res) => {
+// GET ROLE BY SLUG (public)
+app.get('/api/roles/slug/:slug', async (req, res) => {
   try {
     const result = await pool.query(
       'SELECT * FROM roles WHERE url_slug = $1',
@@ -532,6 +734,34 @@ app.get('/api/roles/:slug', async (req, res) => {
       screening_questions: role.screening_questions
     });
 
+  } catch (error) {
+    console.error('Error fetching role:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET ROLE BY ID (authenticated)
+app.get('/api/roles/:id', verifyToken, async (req, res) => {
+  try {
+    let result;
+    // Admins can see all roles
+    if (req.user.isAdmin) {
+      result = await pool.query(
+        'SELECT * FROM roles WHERE id = $1',
+        [req.params.id]
+      );
+    } else {
+      result = await pool.query(
+        'SELECT * FROM roles WHERE id = $1 AND notification_email = $2',
+        [req.params.id, req.user.email]
+      );
+    }
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Role not found' });
+    }
+
+    res.json({ role: result.rows[0] });
   } catch (error) {
     console.error('Error fetching role:', error);
     res.status(500).json({ error: error.message });
@@ -939,6 +1169,1763 @@ app.post('/api/bookings/:id/transcribe', verifyToken, upload.single('recording')
     res.json({ transcript: transcription.text });
   } catch (error) {
     console.error('Transcription error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===== GMAIL OAUTH ENDPOINTS =====
+
+// Generate Gmail OAuth consent URL
+app.post('/api/gmail/auth-url', verifyToken, (req, res) => {
+  try {
+    const authUrl = oauth2Client.generateAuthUrl({
+      access_type: 'offline',
+      scope: GMAIL_SCOPES,
+      prompt: 'consent',
+      state: req.user.email // Pass user email to callback
+    });
+    res.json({ authUrl });
+  } catch (error) {
+    console.error('Error generating auth URL:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Gmail OAuth callback
+app.get('/api/gmail/callback', async (req, res) => {
+  try {
+    const { code, state: userEmail } = req.query;
+    if (!code) {
+      return res.redirect(`${process.env.FRONTEND_URL}/settings?gmail=error&message=No+authorization+code`);
+    }
+
+    const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
+
+    // Get user's Gmail address
+    const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
+    const { data } = await oauth2.userinfo.get();
+    const gmailAddress = data.email;
+
+    // Store tokens in database
+    await pool.query(`
+      INSERT INTO gmail_oauth_tokens (user_email, access_token, refresh_token, token_expiry, gmail_address, updated_at)
+      VALUES ($1, $2, $3, $4, $5, NOW())
+      ON CONFLICT (user_email) DO UPDATE SET
+        access_token = EXCLUDED.access_token,
+        refresh_token = COALESCE(EXCLUDED.refresh_token, gmail_oauth_tokens.refresh_token),
+        token_expiry = EXCLUDED.token_expiry,
+        gmail_address = EXCLUDED.gmail_address,
+        updated_at = NOW()
+    `, [
+      userEmail,
+      tokens.access_token,
+      tokens.refresh_token,
+      new Date(tokens.expiry_date),
+      gmailAddress
+    ]);
+
+    console.log(`Gmail connected for ${userEmail} (${gmailAddress})`);
+    res.redirect(`${process.env.FRONTEND_URL}/settings?gmail=success`);
+  } catch (error) {
+    console.error('Gmail OAuth callback error:', error);
+    res.redirect(`${process.env.FRONTEND_URL}/settings?gmail=error&message=${encodeURIComponent(error.message)}`);
+  }
+});
+
+// Check Gmail connection status
+app.get('/api/gmail/status', verifyToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT gmail_address, token_expiry, updated_at FROM gmail_oauth_tokens WHERE user_email = $1',
+      [req.user.email]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ connected: false });
+    }
+
+    const token = result.rows[0];
+    res.json({
+      connected: true,
+      gmailAddress: token.gmail_address,
+      tokenExpiry: token.token_expiry,
+      lastUpdated: token.updated_at
+    });
+  } catch (error) {
+    console.error('Error checking Gmail status:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Disconnect Gmail
+app.delete('/api/gmail/disconnect', verifyToken, async (req, res) => {
+  try {
+    // Get tokens to revoke
+    const result = await pool.query(
+      'SELECT access_token FROM gmail_oauth_tokens WHERE user_email = $1',
+      [req.user.email]
+    );
+
+    if (result.rows.length > 0) {
+      // Try to revoke the token with Google
+      try {
+        await oauth2Client.revokeToken(result.rows[0].access_token);
+      } catch (revokeErr) {
+        console.log('Token revocation failed (may already be invalid):', revokeErr.message);
+      }
+    }
+
+    // Delete from database
+    await pool.query('DELETE FROM gmail_oauth_tokens WHERE user_email = $1', [req.user.email]);
+
+    res.json({ status: 'disconnected' });
+  } catch (error) {
+    console.error('Error disconnecting Gmail:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Helper: Get Gmail client with refreshed tokens
+async function getGmailClient(userEmail) {
+  const result = await pool.query(
+    'SELECT * FROM gmail_oauth_tokens WHERE user_email = $1',
+    [userEmail]
+  );
+
+  if (result.rows.length === 0) {
+    throw new Error('Gmail not connected');
+  }
+
+  const tokenData = result.rows[0];
+  oauth2Client.setCredentials({
+    access_token: tokenData.access_token,
+    refresh_token: tokenData.refresh_token,
+    expiry_date: new Date(tokenData.token_expiry).getTime()
+  });
+
+  // Check if token needs refresh
+  if (new Date(tokenData.token_expiry) <= new Date()) {
+    const { credentials } = await oauth2Client.refreshAccessToken();
+    await pool.query(
+      'UPDATE gmail_oauth_tokens SET access_token = $1, token_expiry = $2, updated_at = NOW() WHERE user_email = $3',
+      [credentials.access_token, new Date(credentials.expiry_date), userEmail]
+    );
+    oauth2Client.setCredentials(credentials);
+  }
+
+  return google.gmail({ version: 'v1', auth: oauth2Client });
+}
+
+// ===== OUTREACH SEQUENCE TEMPLATES =====
+
+// Generate outreach templates via Claude AI
+app.post('/api/outreach/templates/generate', verifyToken, async (req, res) => {
+  try {
+    const { roleId } = req.body;
+    if (!roleId) return res.status(400).json({ error: 'Role ID is required' });
+
+    // Verify role belongs to user
+    const roleResult = await pool.query(
+      'SELECT * FROM roles WHERE id = $1 AND notification_email = $2',
+      [roleId, req.user.email]
+    );
+    if (roleResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Role not found' });
+    }
+    const role = roleResult.rows[0];
+
+    const templates = [];
+
+    for (let step = 1; step <= 3; step++) {
+      const stepContext = {
+        1: 'This is the INITIAL outreach email. Be warm, personable, and introduce the opportunity compellingly. Hook them with something interesting about the role.',
+        2: 'This is a FOLLOW-UP email (sent 2 days after the first). Reference that you reached out before, add new value or angle, and briefly restate why this could be exciting for them.',
+        3: 'This is the FINAL follow-up (sent 4 days after the first). Be concise and respectful of their time. Give them one last chance to express interest without being pushy.'
+      };
+
+      const prompt = `You are a recruiter writing a short personal email to a potential candidate. Write it exactly like a real person would type an email - casual, direct, no fluff.
+
+ROLE DETAILS:
+- Company: ${role.company_name}
+- Position: ${role.job_title}
+- Description: ${role.job_description}
+
+TASK: Write email #${step} of a 3-email sequence.
+${stepContext[step]}
+
+CRITICAL RULES:
+- Use {{first_name}} as a placeholder for the candidate's name
+- Use {{current_role}} as a placeholder for their current job title (may be empty)
+- Use {{current_company}} as a placeholder for their current employer (may be empty)
+- Write like a REAL person sending a quick email, NOT a marketing email
+- Keep it SHORT - 2-3 short paragraphs max
+- No fancy language, no buzzwords, no corporate speak
+- No "I hope this finds you well" or similar
+- No links, buttons, or CTAs - the candidate will just reply to the email
+- End naturally, like asking "Would you be open to a quick chat?" or similar
+- The subject line should look like something a real person would write (lowercase ok, no marketing speak)
+
+Respond with JSON only:
+{
+  "subject": "casual subject line",
+  "bodyText": "Plain text email body"
+}`;
+
+      const message = await anthropic.messages.create({
+        model: 'claude-sonnet-4-5-20250929',
+        max_tokens: 600,
+        messages: [{ role: 'user', content: prompt }]
+      });
+
+      const responseText = message.content[0].text;
+      const cleanJson = responseText.replace(/```json|```/g, '').trim();
+      const parsed = JSON.parse(cleanJson);
+
+      templates.push({
+        step,
+        subject: parsed.subject,
+        bodyText: parsed.bodyText
+      });
+    }
+
+    res.json({ templates });
+  } catch (error) {
+    console.error('Template generation error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get saved templates for a role
+app.get('/api/outreach/templates/:roleId', verifyToken, async (req, res) => {
+  try {
+    const { roleId } = req.params;
+
+    // Verify role belongs to user
+    const roleCheck = await pool.query(
+      'SELECT * FROM roles WHERE id = $1 AND notification_email = $2',
+      [roleId, req.user.email]
+    );
+    if (roleCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Role not found' });
+    }
+
+    const result = await pool.query(
+      'SELECT sequence_step AS step, subject, body_text AS "bodyText" FROM outreach_templates WHERE role_id = $1 ORDER BY sequence_step',
+      [roleId]
+    );
+
+    res.json({
+      templates: result.rows,
+      role: roleCheck.rows[0]
+    });
+  } catch (error) {
+    console.error('Error fetching templates:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Save templates for a role
+app.put('/api/outreach/templates/:roleId', verifyToken, async (req, res) => {
+  try {
+    const { roleId } = req.params;
+    const { templates } = req.body;
+
+    if (!templates || !Array.isArray(templates) || templates.length !== 3) {
+      return res.status(400).json({ error: 'Must provide exactly 3 templates' });
+    }
+
+    // Verify role belongs to user
+    const roleCheck = await pool.query(
+      'SELECT id FROM roles WHERE id = $1 AND notification_email = $2',
+      [roleId, req.user.email]
+    );
+    if (roleCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Role not found' });
+    }
+
+    // Upsert all templates
+    for (const t of templates) {
+      if (!t.step || !t.subject || !t.bodyText) {
+        return res.status(400).json({ error: 'Each template needs step, subject, and bodyText' });
+      }
+      await pool.query(`
+        INSERT INTO outreach_templates (role_id, sequence_step, subject, body_text, updated_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        ON CONFLICT (role_id, sequence_step) DO UPDATE SET
+          subject = EXCLUDED.subject,
+          body_text = EXCLUDED.body_text,
+          updated_at = NOW()
+      `, [roleId, t.step, t.subject, t.bodyText]);
+    }
+
+    res.json({ status: 'saved' });
+  } catch (error) {
+    console.error('Error saving templates:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Preview email with sample candidate data
+app.post('/api/outreach/templates/preview', verifyToken, async (req, res) => {
+  try {
+    const { roleId, step, subject, bodyText } = req.body;
+
+    // Verify role belongs to user
+    const roleResult = await pool.query(
+      'SELECT * FROM roles WHERE id = $1 AND notification_email = $2',
+      [roleId, req.user.email]
+    );
+    if (roleResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Role not found' });
+    }
+    const role = roleResult.rows[0];
+
+    // Sample candidate for preview
+    const sampleCandidate = {
+      id: 0,
+      firstName: 'Alex',
+      lastName: 'Johnson',
+      email: 'alex.johnson@example.com',
+      currentJobTitle: 'Senior Software Engineer',
+      currentEmployer: 'Tech Corp'
+    };
+
+    // Replace placeholders
+    const personalizedBody = bodyText
+      .replace(/\{\{first_name\}\}/gi, sampleCandidate.firstName)
+      .replace(/\{\{current_role\}\}/gi, sampleCandidate.currentJobTitle || '')
+      .replace(/\{\{current_company\}\}/gi, sampleCandidate.currentEmployer || '');
+
+    const personalizedSubject = subject
+      .replace(/\{\{first_name\}\}/gi, sampleCandidate.firstName)
+      .replace(/\{\{current_role\}\}/gi, sampleCandidate.currentJobTitle || '')
+      .replace(/\{\{current_company\}\}/gi, sampleCandidate.currentEmployer || '');
+
+    // Generate HTML preview
+    const bodyHtml = generateEmailHtml(personalizedBody, sampleCandidate, role);
+
+    res.json({
+      subject: personalizedSubject,
+      bodyHtml,
+      sampleCandidate
+    });
+  } catch (error) {
+    console.error('Preview error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===== OUTREACH CANDIDATE MANAGEMENT =====
+
+// Upload candidates via CSV
+app.post('/api/outreach/candidates/upload', verifyToken, upload.single('csv'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No CSV file uploaded' });
+    const { roleId } = req.body;
+    if (!roleId) return res.status(400).json({ error: 'Role ID is required' });
+
+    // Verify role belongs to user
+    const roleResult = await pool.query(
+      'SELECT * FROM roles WHERE id = $1 AND notification_email = $2',
+      [roleId, req.user.email]
+    );
+    if (roleResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Role not found' });
+    }
+    const role = roleResult.rows[0];
+
+    // Get GDPR countries
+    const gdprResult = await pool.query('SELECT country_code, country_name FROM gdpr_countries');
+    const gdprCountries = new Set(gdprResult.rows.map(r => r.country_name.toLowerCase()));
+    const gdprCodes = new Set(gdprResult.rows.map(r => r.country_code.toLowerCase()));
+
+    // Parse CSV (strip BOM, handle various delimiters)
+    let csvText = req.file.buffer.toString('utf-8').replace(/^\uFEFF/, '');
+    const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: 'greedy', dynamicTyping: false, delimitersToGuess: [',', ';', '\t', '|'] });
+
+    // Only fail on fatal errors (no data at all), ignore minor parse warnings
+    if (!parsed.data || parsed.data.length === 0) {
+      return res.status(400).json({ error: 'CSV parsing error: no data found', details: parsed.errors });
+    }
+
+    const candidates = [];
+    const errors = [];
+
+    for (let i = 0; i < parsed.data.length; i++) {
+      const row = parsed.data[i];
+      const rowNum = i + 2; // Account for header row
+
+      // Normalize column names (case-insensitive)
+      const normalized = {};
+      Object.keys(row).forEach(key => {
+        normalized[key.toLowerCase().trim().replace(/\s+/g, '_')] = row[key]?.trim();
+      });
+
+      const firstName = normalized.first_name || normalized.firstname || normalized.name?.split(' ')[0];
+      const lastName = normalized.last_name || normalized.lastname || normalized.name?.split(' ').slice(1).join(' ') || '';
+      const email = normalized.email;
+      const country = normalized.country || '';
+      // Handle "LinkedIn / Profile URL" column (becomes "linkedin_/_profile_url" after normalization)
+      const linkedinUrl = normalized['linkedin_/_profile_url'] || normalized.linkedin_url || normalized.linkedin || '';
+      const currentJobTitle = normalized.current_job_title || normalized.job_title || normalized.title || '';
+      const currentEmployer = normalized.current_employer || normalized.employer || normalized.company || '';
+
+      if (!firstName) {
+        errors.push({ row: rowNum, error: 'Missing first_name' });
+        continue;
+      }
+
+      // Check if we have email or LinkedIn
+      const hasEmail = email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+      const hasLinkedIn = linkedinUrl && linkedinUrl.length > 0;
+
+      if (!hasEmail && !hasLinkedIn) {
+        errors.push({ row: rowNum, error: 'Missing both email and LinkedIn URL' });
+        continue;
+      }
+
+      // Check GDPR status
+      const countryLower = country.toLowerCase();
+      const isGdpr = gdprCountries.has(countryLower) || gdprCodes.has(countryLower);
+
+      candidates.push({
+        firstName,
+        lastName,
+        email: hasEmail ? email.toLowerCase() : null,
+        country,
+        isGdpr,
+        linkedinUrl,
+        currentJobTitle,
+        currentEmployer,
+        isLinkedInOnly: !hasEmail && hasLinkedIn
+      });
+    }
+
+    if (candidates.length === 0) {
+      return res.status(400).json({ error: 'No valid candidates in CSV', details: errors });
+    }
+
+    // Insert candidates
+    const inserted = [];
+    const linkedinOnly = [];
+    const duplicates = [];
+
+    for (const c of candidates) {
+      try {
+        // Set status based on whether they have email or just LinkedIn
+        const status = c.isLinkedInOnly ? 'linkedin_only' : 'active';
+
+        const result = await pool.query(`
+          INSERT INTO outreach_candidates (role_id, first_name, last_name, email, country, linkedin_url, current_job_title, current_employer, is_gdpr_country, status, created_by)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+          RETURNING id
+        `, [roleId, c.firstName, c.lastName, c.email, c.country, c.linkedinUrl, c.currentJobTitle, c.currentEmployer, c.isGdpr, status, req.user.email]);
+
+        const candidateId = result.rows[0].id;
+
+        if (c.isLinkedInOnly) {
+          // LinkedIn-only candidates go to manual outreach queue
+          linkedinOnly.push({ ...c, id: candidateId });
+        } else {
+          inserted.push({ ...c, id: candidateId });
+
+          // Only schedule email sequences for candidates with email
+          const today = new Date();
+          for (let step = 1; step <= 3; step++) {
+            const scheduledDate = new Date(today);
+            scheduledDate.setDate(today.getDate() + (step === 1 ? 0 : step === 2 ? 2 : 4));
+            const dateStr = scheduledDate.toISOString().split('T')[0];
+            const trackingPixelId = crypto.randomBytes(16).toString('hex');
+
+            // Generate AI email content
+            const emailContent = await generateOutreachEmail(role, c, step);
+
+            await pool.query(`
+              INSERT INTO outreach_emails (candidate_id, sequence_step, subject, body_html, scheduled_for, tracking_pixel_id)
+              VALUES ($1, $2, $3, $4, $5, $6)
+            `, [candidateId, step, emailContent.subject, emailContent.bodyHtml, dateStr, trackingPixelId]);
+          }
+        }
+      } catch (err) {
+        if (err.code === '23505') {
+          duplicates.push(c.email || c.linkedinUrl);
+        } else {
+          errors.push({ email: c.email || c.linkedinUrl, error: err.message });
+        }
+      }
+    }
+
+    res.json({
+      inserted: inserted.length,
+      linkedinOnly: linkedinOnly.length,
+      duplicates: duplicates.length,
+      errors: errors.length,
+      details: { duplicates, errors, linkedinOnly: linkedinOnly.length }
+    });
+  } catch (error) {
+    console.error('Error uploading candidates:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Generate AI-powered outreach email (or use saved template)
+async function generateOutreachEmail(role, candidate, step) {
+  // First, check if there's a saved template for this role/step
+  const savedTemplate = await pool.query(
+    'SELECT subject, body_text FROM outreach_templates WHERE role_id = $1 AND sequence_step = $2',
+    [role.id, step]
+  );
+
+  if (savedTemplate.rows.length > 0) {
+    // Use saved template with placeholder replacement
+    const template = savedTemplate.rows[0];
+
+    const personalizedSubject = template.subject
+      .replace(/\{\{first_name\}\}/gi, candidate.firstName)
+      .replace(/\{\{current_role\}\}/gi, candidate.currentJobTitle || '')
+      .replace(/\{\{current_company\}\}/gi, candidate.currentEmployer || '');
+
+    const personalizedBody = template.body_text
+      .replace(/\{\{first_name\}\}/gi, candidate.firstName)
+      .replace(/\{\{current_role\}\}/gi, candidate.currentJobTitle || '')
+      .replace(/\{\{current_company\}\}/gi, candidate.currentEmployer || '');
+
+    const bodyHtml = generateEmailHtml(personalizedBody, candidate, role);
+
+    return {
+      subject: personalizedSubject,
+      bodyHtml
+    };
+  }
+
+  // No saved template - generate with AI
+  const stepContext = {
+    1: 'This is the initial outreach email. Be warm and introduce the opportunity.',
+    2: 'This is a follow-up email. Reference that you reached out before and briefly restate the opportunity.',
+    3: 'This is the final follow-up. Be concise and give them a last chance to express interest.'
+  };
+
+  const prompt = `You are a recruiter writing a short personal email. Write it exactly like a real person would - casual, direct, no fluff.
+
+Candidate: ${candidate.firstName} ${candidate.lastName}
+Country: ${candidate.country || 'Unknown'}
+Current Role: ${candidate.currentJobTitle || 'Unknown'}
+Current Company: ${candidate.currentEmployer || 'Unknown'}
+
+Company: ${role.company_name}
+Job Title: ${role.job_title}
+Job Description: ${role.job_description}
+
+Context: ${stepContext[step]}
+${candidate.currentJobTitle ? `Reference their current role (${candidate.currentJobTitle}) naturally.` : ''}
+
+CRITICAL RULES:
+- Write like a REAL person sending a quick email, NOT a marketing email
+- Keep it SHORT - 2-3 short paragraphs max
+- No fancy language, buzzwords, or corporate speak
+- No "I hope this finds you well" or similar openers
+- No links, buttons, or CTAs - the candidate will just reply
+- End naturally like "Would you be open to a quick chat?" or similar
+- Do NOT use placeholders like [Company] - use the actual values
+- Subject line should look human (lowercase ok, no marketing speak)
+
+Respond with JSON only:
+{
+  "subject": "casual subject line",
+  "bodyText": "Plain text email body without any HTML"
+}`;
+
+  try {
+    const message = await anthropic.messages.create({
+      model: 'claude-sonnet-4-5-20250929',
+      max_tokens: 500,
+      messages: [{ role: 'user', content: prompt }]
+    });
+
+    const responseText = message.content[0].text;
+    const cleanJson = responseText.replace(/```json|```/g, '').trim();
+    const parsed = JSON.parse(cleanJson);
+
+    // Convert to HTML with CTA buttons
+    const bodyHtml = generateEmailHtml(parsed.bodyText, candidate, role);
+
+    return {
+      subject: parsed.subject,
+      bodyHtml
+    };
+  } catch (error) {
+    console.error('AI email generation error:', error);
+    // Fallback template
+    const fallbackText = `Hi ${candidate.firstName},\n\nI came across your profile and thought you might be interested in a ${role.job_title} opportunity at ${role.company_name}.\n\nWould you be open to learning more?`;
+    return {
+      subject: `${role.job_title} opportunity at ${role.company_name}`,
+      bodyHtml: generateEmailHtml(fallbackText, candidate, role)
+    };
+  }
+}
+
+// Generate email body - just plain text, no HTML formatting
+function generateEmailHtml(bodyText, candidate, role) {
+  // Store as plain text - will be sent as multipart (plain + html with tracking pixel)
+  return bodyText;
+}
+
+// List candidates for a role
+app.get('/api/outreach/candidates/:roleId', verifyToken, async (req, res) => {
+  try {
+    const { roleId } = req.params;
+    const { status } = req.query;
+
+    // Verify role belongs to user (admins can see all)
+    let roleCheck;
+    if (req.user.isAdmin) {
+      roleCheck = await pool.query('SELECT id FROM roles WHERE id = $1', [roleId]);
+    } else {
+      roleCheck = await pool.query(
+        'SELECT id FROM roles WHERE id = $1 AND notification_email = $2',
+        [roleId, req.user.email]
+      );
+    }
+    if (roleCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Role not found' });
+    }
+
+    let query = `
+      SELECT c.*,
+        (SELECT COUNT(*) FROM outreach_emails e WHERE e.candidate_id = c.id AND e.status = 'sent') AS emails_sent,
+        (SELECT MAX(sent_at) FROM outreach_emails e WHERE e.candidate_id = c.id) AS last_email_at,
+        (SELECT reply_text FROM outreach_responses r WHERE r.candidate_id = c.id AND r.response_type = 'email_reply' ORDER BY r.responded_at DESC LIMIT 1) AS reply_text,
+        (SELECT sentiment FROM outreach_responses r WHERE r.candidate_id = c.id AND r.response_type = 'email_reply' ORDER BY r.responded_at DESC LIMIT 1) AS reply_sentiment
+      FROM outreach_candidates c
+      WHERE c.role_id = $1
+    `;
+    const params = [roleId];
+
+    if (status) {
+      query += ' AND c.status = $2';
+      params.push(status);
+    }
+
+    query += ' ORDER BY c.created_at DESC';
+
+    const result = await pool.query(query, params);
+    res.json({ candidates: result.rows });
+  } catch (error) {
+    console.error('Error listing candidates:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete a candidate
+app.delete('/api/outreach/candidates/:id', verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Verify candidate belongs to user's role
+    const check = await pool.query(`
+      SELECT c.id FROM outreach_candidates c
+      JOIN roles r ON r.id::text = c.role_id
+      WHERE c.id = $1 AND r.notification_email = $2
+    `, [id, req.user.email]);
+
+    if (check.rows.length === 0) {
+      return res.status(404).json({ error: 'Candidate not found' });
+    }
+
+    await pool.query('DELETE FROM outreach_candidates WHERE id = $1', [id]);
+    res.json({ status: 'deleted' });
+  } catch (error) {
+    console.error('Error deleting candidate:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===== CTA RESPONSE HANDLERS (Public) =====
+
+// Handle interested/not interested clicks
+app.get('/api/outreach/respond/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+    const { response } = req.query;
+
+    if (!['interested', 'not_interested'].includes(response)) {
+      return res.status(400).send('Invalid response');
+    }
+
+    // Verify token
+    let decoded;
+    try {
+      decoded = jwt.verify(token, process.env.JWT_SECRET);
+    } catch {
+      return res.status(400).send('Invalid or expired link');
+    }
+
+    const { candidateId } = decoded;
+
+    // Check candidate exists and hasn't already responded
+    const candidateResult = await pool.query(
+      'SELECT * FROM outreach_candidates WHERE id = $1',
+      [candidateId]
+    );
+
+    if (candidateResult.rows.length === 0) {
+      return res.status(404).send('Candidate not found');
+    }
+
+    const candidate = candidateResult.rows[0];
+    if (['interested', 'not_interested', 'responded', 'unsubscribed'].includes(candidate.status)) {
+      // Already responded - redirect appropriately
+      if (response === 'interested') {
+        const roleResult = await pool.query('SELECT url_slug FROM roles WHERE id = $1', [candidate.role_id]);
+        return res.redirect(`${process.env.FRONTEND_URL}/screen/${roleResult.rows[0].url_slug}`);
+      }
+      return res.redirect(`${process.env.FRONTEND_URL}/outreach/thank-you`);
+    }
+
+    // Update candidate status
+    const statusField = response === 'interested' ? 'interested_at' : 'not_interested_at';
+    await pool.query(`
+      UPDATE outreach_candidates
+      SET status = $1, ${statusField} = NOW()
+      WHERE id = $2
+    `, [response, candidateId]);
+
+    // Cancel pending emails
+    await pool.query(`
+      UPDATE outreach_emails
+      SET status = 'cancelled'
+      WHERE candidate_id = $1 AND status = 'pending'
+    `, [candidateId]);
+
+    // Record response
+    await pool.query(`
+      INSERT INTO outreach_responses (candidate_id, response_type, ip_address, user_agent)
+      VALUES ($1, $2, $3, $4)
+    `, [candidateId, response, req.ip, req.get('User-Agent')]);
+
+    // Redirect based on response
+    if (response === 'interested') {
+      const roleResult = await pool.query('SELECT url_slug FROM roles WHERE id = $1', [candidate.role_id]);
+      const screeningUrl = `${process.env.FRONTEND_URL}/screen/${roleResult.rows[0].url_slug}`;
+
+      // Store screening link
+      await pool.query('UPDATE outreach_candidates SET screening_link = $1 WHERE id = $2', [screeningUrl, candidateId]);
+
+      res.redirect(screeningUrl);
+    } else {
+      res.redirect(`${process.env.FRONTEND_URL}/outreach/thank-you`);
+    }
+  } catch (error) {
+    console.error('Response handler error:', error);
+    res.status(500).send('An error occurred');
+  }
+});
+
+// Unsubscribe handler
+app.get('/api/outreach/unsubscribe/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+
+    let decoded;
+    try {
+      decoded = jwt.verify(token, process.env.JWT_SECRET);
+    } catch {
+      return res.status(400).send('Invalid or expired link');
+    }
+
+    const { candidateId } = decoded;
+
+    await pool.query(`
+      UPDATE outreach_candidates
+      SET status = 'unsubscribed'
+      WHERE id = $1
+    `, [candidateId]);
+
+    await pool.query(`
+      UPDATE outreach_emails
+      SET status = 'cancelled'
+      WHERE candidate_id = $1 AND status = 'pending'
+    `, [candidateId]);
+
+    await pool.query(`
+      INSERT INTO outreach_responses (candidate_id, response_type)
+      VALUES ($1, 'unsubscribe')
+    `, [candidateId]);
+
+    res.redirect(`${process.env.FRONTEND_URL}/outreach/thank-you?unsubscribed=true`);
+  } catch (error) {
+    console.error('Unsubscribe error:', error);
+    res.status(500).send('An error occurred');
+  }
+});
+
+// Tracking pixel
+app.get('/api/outreach/pixel/:id.png', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Update email open count
+    await pool.query(`
+      UPDATE outreach_emails
+      SET open_count = open_count + 1,
+          first_opened_at = COALESCE(first_opened_at, NOW())
+      WHERE tracking_pixel_id = $1
+    `, [id]);
+
+    // Return 1x1 transparent PNG
+    const pixel = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64');
+    res.set('Content-Type', 'image/png');
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.send(pixel);
+  } catch (error) {
+    console.error('Tracking pixel error:', error);
+    res.status(204).end();
+  }
+});
+
+// ===== OUTREACH ANALYTICS =====
+
+// Dashboard overview (must be before :roleId route to avoid "dashboard" matching as a roleId)
+app.get('/api/outreach/analytics/dashboard', verifyToken, async (req, res) => {
+  try {
+    const isAdmin = req.user.isAdmin || false;
+
+    let query, params;
+    if (isAdmin) {
+      query = `
+        SELECT
+          r.id AS role_id,
+          r.company_name,
+          r.job_title,
+          r.notification_email AS owner_email,
+          COUNT(c.id)::int AS total_candidates,
+          COUNT(CASE WHEN c.status = 'interested' THEN 1 END)::int AS interested,
+          COUNT(CASE WHEN c.status = 'active' THEN 1 END)::int AS active
+        FROM roles r
+        INNER JOIN outreach_candidates c ON c.role_id = r.id::text
+        GROUP BY r.id
+        ORDER BY r.id DESC
+      `;
+      params = [];
+    } else {
+      query = `
+        SELECT
+          r.id AS role_id,
+          r.company_name,
+          r.job_title,
+          COUNT(c.id)::int AS total_candidates,
+          COUNT(CASE WHEN c.status = 'interested' THEN 1 END)::int AS interested,
+          COUNT(CASE WHEN c.status = 'active' THEN 1 END)::int AS active
+        FROM roles r
+        INNER JOIN outreach_candidates c ON c.role_id = r.id::text
+        WHERE r.notification_email = $1
+        GROUP BY r.id
+        ORDER BY r.id DESC
+      `;
+      params = [req.user.email];
+    }
+
+    const result = await pool.query(query, params);
+    res.json({ roles: result.rows });
+  } catch (error) {
+    console.error('Dashboard error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get analytics for a role
+app.get('/api/outreach/analytics/:roleId', verifyToken, async (req, res) => {
+  try {
+    const { roleId } = req.params;
+
+    // Verify role belongs to user (admins can see all)
+    let roleCheck;
+    if (req.user.isAdmin) {
+      roleCheck = await pool.query('SELECT id FROM roles WHERE id = $1', [roleId]);
+    } else {
+      roleCheck = await pool.query(
+        'SELECT id FROM roles WHERE id = $1 AND notification_email = $2',
+        [roleId, req.user.email]
+      );
+    }
+    if (roleCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Role not found' });
+    }
+
+    // Calculate real-time analytics
+    const stats = await pool.query(`
+      SELECT
+        COUNT(*)::int AS total_candidates,
+        COUNT(CASE WHEN status = 'interested' THEN 1 END)::int AS interested,
+        COUNT(CASE WHEN status = 'not_interested' THEN 1 END)::int AS not_interested,
+        COUNT(CASE WHEN status = 'responded' THEN 1 END)::int AS responded,
+        COUNT(CASE WHEN status = 'unsubscribed' THEN 1 END)::int AS unsubscribed,
+        COUNT(CASE WHEN status = 'active' THEN 1 END)::int AS active,
+        COUNT(CASE WHEN status = 'gdpr_anonymized' THEN 1 END)::int AS anonymized
+      FROM outreach_candidates
+      WHERE role_id = $1
+    `, [roleId]);
+
+    const emailStats = await pool.query(`
+      SELECT
+        sequence_step,
+        COUNT(CASE WHEN status = 'sent' THEN 1 END)::int AS sent,
+        COUNT(CASE WHEN open_count > 0 THEN 1 END)::int AS opened
+      FROM outreach_emails e
+      JOIN outreach_candidates c ON c.id = e.candidate_id
+      WHERE c.role_id = $1
+      GROUP BY sequence_step
+    `, [roleId]);
+
+    const emailStatsByStep = {};
+    emailStats.rows.forEach(row => {
+      emailStatsByStep[`step${row.sequence_step}`] = { sent: row.sent, opened: row.opened };
+    });
+
+    res.json({
+      candidates: stats.rows[0],
+      emails: emailStatsByStep
+    });
+  } catch (error) {
+    console.error('Analytics error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===== DEBUG & MANUAL TRIGGERS =====
+
+// Debug: Check pending emails
+app.get('/api/admin/debug/emails', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+
+    const pending = await pool.query(`
+      SELECT e.id, e.sequence_step, e.subject, e.scheduled_for, e.status,
+             c.first_name, c.last_name, c.email AS candidate_email, c.status AS candidate_status,
+             r.notification_email AS recruiter_email, r.job_title
+      FROM outreach_emails e
+      JOIN outreach_candidates c ON c.id = e.candidate_id
+      JOIN roles r ON r.id::text = c.role_id
+      WHERE e.status = 'pending'
+      ORDER BY e.scheduled_for ASC
+      LIMIT 50
+    `);
+
+    const gmailConnections = await pool.query('SELECT user_email, gmail_address FROM gmail_oauth_tokens');
+
+    res.json({
+      today,
+      pendingEmails: pending.rows,
+      gmailConnections: gmailConnections.rows
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Manual trigger: Send pending emails now
+app.post('/api/admin/trigger-emails', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+
+    const emails = await pool.query(`
+      SELECT e.*, c.email AS candidate_email, c.first_name, c.status AS candidate_status,
+             r.notification_email AS recruiter_email, r.company_name
+      FROM outreach_emails e
+      JOIN outreach_candidates c ON c.id = e.candidate_id
+      JOIN roles r ON r.id::text = c.role_id
+      WHERE e.status = 'pending'
+        AND e.scheduled_for <= $1
+        AND c.status = 'active'
+      ORDER BY e.scheduled_for ASC
+      LIMIT 10
+    `, [today]);
+
+    const results = [];
+
+    for (const email of emails.rows) {
+      try {
+        const gmail = await getGmailClient(email.recruiter_email);
+
+        const backendUrl = process.env.FRONTEND_URL?.replace('5173', '3001') || 'http://localhost:3001';
+        const boundary = `boundary_${crypto.randomBytes(8).toString('hex')}`;
+        const plainText = email.body_html;
+        const htmlVersion = plainText.replace(/\n/g, '<br>') +
+          `<img src="${backendUrl}/api/outreach/pixel/${email.tracking_pixel_id}.png" width="1" height="1" style="display:none" />`;
+
+        const messageParts = [
+          `To: ${email.candidate_email}`,
+          `Subject: ${email.subject}`,
+          'MIME-Version: 1.0',
+          `Content-Type: multipart/alternative; boundary="${boundary}"`,
+          '',
+          `--${boundary}`,
+          'Content-Type: text/plain; charset=utf-8',
+          '',
+          plainText,
+          `--${boundary}`,
+          'Content-Type: text/html; charset=utf-8',
+          '',
+          htmlVersion,
+          `--${boundary}--`
+        ];
+        const rawMessage = Buffer.from(messageParts.join('\r\n')).toString('base64url');
+
+        const response = await gmail.users.messages.send({
+          userId: 'me',
+          requestBody: { raw: rawMessage }
+        });
+
+        await pool.query(`
+          UPDATE outreach_emails
+          SET status = 'sent', sent_at = NOW(), gmail_message_id = $1, gmail_thread_id = $2
+          WHERE id = $3
+        `, [response.data.id, response.data.threadId, email.id]);
+
+        results.push({ id: email.id, to: email.candidate_email, status: 'sent' });
+
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      } catch (sendErr) {
+        await pool.query(`
+          UPDATE outreach_emails
+          SET status = 'failed', error_message = $1
+          WHERE id = $2
+        `, [sendErr.message, email.id]);
+        results.push({ id: email.id, to: email.candidate_email, status: 'failed', error: sendErr.message });
+      }
+    }
+
+    res.json({ processed: results.length, results });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Manual trigger: Check for replies now
+app.post('/api/admin/trigger-reply-check', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const results = [];
+
+    // Backfill missing thread IDs
+    const missingThreads = await pool.query(`
+      SELECT e.id, e.gmail_message_id, r.notification_email AS recruiter_email
+      FROM outreach_emails e
+      JOIN outreach_candidates c ON c.id = e.candidate_id
+      JOIN roles r ON r.id::text = c.role_id
+      WHERE e.status = 'sent' AND e.gmail_message_id IS NOT NULL AND e.gmail_thread_id IS NULL
+    `);
+
+    for (const row of missingThreads.rows) {
+      try {
+        const gmail = await getGmailClient(row.recruiter_email);
+        const msg = await gmail.users.messages.get({ userId: 'me', id: row.gmail_message_id, format: 'minimal' });
+        if (msg.data.threadId) {
+          await pool.query('UPDATE outreach_emails SET gmail_thread_id = $1 WHERE id = $2', [msg.data.threadId, row.id]);
+          results.push({ action: 'backfill_thread', email_id: row.id, thread_id: msg.data.threadId });
+        }
+      } catch (err) {
+        results.push({ action: 'backfill_error', email_id: row.id, error: err.message });
+      }
+    }
+
+    // Check for replies
+    const sentEmails = await pool.query(`
+      SELECT DISTINCT ON (e.gmail_thread_id)
+        e.id AS email_id, e.gmail_thread_id, e.gmail_message_id, e.candidate_id,
+        c.first_name, c.last_name, c.email AS candidate_email, c.status AS candidate_status,
+        c.role_id, r.notification_email AS recruiter_email, r.url_slug, r.company_name, r.job_title
+      FROM outreach_emails e
+      JOIN outreach_candidates c ON c.id = e.candidate_id
+      JOIN roles r ON r.id::text = c.role_id
+      WHERE e.status = 'sent' AND e.gmail_thread_id IS NOT NULL AND c.status = 'active'
+      ORDER BY e.gmail_thread_id, e.sequence_step DESC
+    `);
+
+    for (const email of sentEmails.rows) {
+      try {
+        const gmail = await getGmailClient(email.recruiter_email);
+        const thread = await gmail.users.threads.get({ userId: 'me', id: email.gmail_thread_id, format: 'full' });
+        const messages = thread.data.messages || [];
+
+        if (messages.length <= 1) {
+          results.push({ candidate: email.candidate_email, status: 'no_reply' });
+          continue;
+        }
+
+        const existingReply = await pool.query(
+          `SELECT id FROM outreach_responses WHERE candidate_id = $1 AND response_type = 'email_reply'`,
+          [email.candidate_id]
+        );
+        if (existingReply.rows.length > 0) {
+          results.push({ candidate: email.candidate_email, status: 'already_processed' });
+          continue;
+        }
+
+        const replyMessages = messages.filter(msg => {
+          const fromHeader = msg.payload?.headers?.find(h => h.name.toLowerCase() === 'from')?.value || '';
+          return !fromHeader.toLowerCase().includes(email.recruiter_email.toLowerCase());
+        });
+
+        if (replyMessages.length === 0) {
+          results.push({ candidate: email.candidate_email, status: 'no_candidate_reply' });
+          continue;
+        }
+
+        const latestReply = replyMessages[replyMessages.length - 1];
+        let replyText = '';
+        function extractText(payload) {
+          if (payload.mimeType === 'text/plain' && payload.body?.data) {
+            return Buffer.from(payload.body.data, 'base64').toString('utf-8');
+          }
+          if (payload.parts) {
+            for (const part of payload.parts) {
+              const text = extractText(part);
+              if (text) return text;
+            }
+          }
+          return '';
+        }
+        replyText = extractText(latestReply.payload);
+
+        const cleanReply = replyText ? replyText.split(/\nOn .* wrote:\n/)[0].split(/\n>/).shift().trim() : '';
+
+        if (!cleanReply) {
+          results.push({ candidate: email.candidate_email, status: 'empty_reply' });
+          continue;
+        }
+
+        // Analyze with Claude
+        const sentimentResult = await anthropic.messages.create({
+          model: 'claude-sonnet-4-5-20250929',
+          max_tokens: 200,
+          messages: [{
+            role: 'user',
+            content: `You are analyzing a candidate's reply to a recruiting outreach email for the role "${email.job_title}" at "${email.company_name}".
+
+The candidate (${email.first_name} ${email.last_name}) replied:
+"${cleanReply}"
+
+Classify the sentiment as exactly one of:
+- "interested" - they want to learn more, are open to chatting, positive response
+- "not_interested" - they decline, say no thanks, not looking, etc.
+- "maybe" - they're unsure, ask for more info without committing, or the response is ambiguous
+
+Respond with JSON only:
+{
+  "sentiment": "interested|not_interested|maybe",
+  "reason": "brief explanation"
+}`
+          }]
+        });
+
+        const parsed = JSON.parse(sentimentResult.content[0].text.replace(/```json|```/g, '').trim());
+
+        await pool.query(`
+          INSERT INTO outreach_responses (candidate_id, email_id, response_type, reply_text, sentiment)
+          VALUES ($1, $2, 'email_reply', $3, $4)
+        `, [email.candidate_id, email.email_id, cleanReply, parsed.sentiment]);
+
+        if (parsed.sentiment === 'interested') {
+          const screeningUrl = `${process.env.FRONTEND_URL}/screen/${email.url_slug}`;
+          await pool.query(`UPDATE outreach_candidates SET status = 'interested', interested_at = NOW(), screening_link = $1 WHERE id = $2`, [screeningUrl, email.candidate_id]);
+        } else if (parsed.sentiment === 'not_interested') {
+          await pool.query(`UPDATE outreach_candidates SET status = 'not_interested', not_interested_at = NOW() WHERE id = $1`, [email.candidate_id]);
+        } else {
+          await pool.query(`UPDATE outreach_candidates SET status = 'responded', responded_at = NOW() WHERE id = $1`, [email.candidate_id]);
+        }
+
+        if (['interested', 'not_interested'].includes(parsed.sentiment)) {
+          await pool.query(`UPDATE outreach_emails SET status = 'cancelled' WHERE candidate_id = $1 AND status = 'pending'`, [email.candidate_id]);
+        }
+
+        results.push({ candidate: email.candidate_email, status: 'processed', sentiment: parsed.sentiment, reason: parsed.reason, reply: cleanReply.substring(0, 100) });
+      } catch (err) {
+        results.push({ candidate: email.candidate_email, status: 'error', error: err.message });
+      }
+    }
+
+    res.json({ results });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===== BACKGROUND JOBS (node-cron) =====
+
+// Send scheduled outreach emails (every 15 minutes)
+cron.schedule('*/15 * * * *', async () => {
+  console.log('Running outreach email job...');
+  try {
+    const today = new Date().toISOString().split('T')[0];
+
+    // Get pending emails scheduled for today or earlier
+    const emails = await pool.query(`
+      SELECT e.*, c.email AS candidate_email, c.first_name, c.status AS candidate_status,
+             r.notification_email AS recruiter_email, r.company_name
+      FROM outreach_emails e
+      JOIN outreach_candidates c ON c.id = e.candidate_id
+      JOIN roles r ON r.id::text = c.role_id
+      WHERE e.status = 'pending'
+        AND e.scheduled_for <= $1
+        AND c.status = 'active'
+      ORDER BY e.scheduled_for ASC
+      LIMIT 50
+    `, [today]);
+
+    for (const email of emails.rows) {
+      try {
+        // Get Gmail client for recruiter
+        const gmail = await getGmailClient(email.recruiter_email);
+
+        // Build multipart email: plain text + html with tracking pixel
+        const backendUrl = process.env.FRONTEND_URL?.replace('5173', '3001') || 'http://localhost:3001';
+        const boundary = `boundary_${crypto.randomBytes(8).toString('hex')}`;
+        const plainText = email.body_html; // body_html now stores plain text
+        const htmlVersion = plainText.replace(/\n/g, '<br>') +
+          `<img src="${backendUrl}/api/outreach/pixel/${email.tracking_pixel_id}.png" width="1" height="1" style="display:none" />`;
+
+        const messageParts = [
+          `To: ${email.candidate_email}`,
+          `Subject: ${email.subject}`,
+          'MIME-Version: 1.0',
+          `Content-Type: multipart/alternative; boundary="${boundary}"`,
+          '',
+          `--${boundary}`,
+          'Content-Type: text/plain; charset=utf-8',
+          '',
+          plainText,
+          `--${boundary}`,
+          'Content-Type: text/html; charset=utf-8',
+          '',
+          htmlVersion,
+          `--${boundary}--`
+        ];
+        const rawMessage = Buffer.from(messageParts.join('\r\n')).toString('base64url');
+
+        // Send via Gmail API
+        const response = await gmail.users.messages.send({
+          userId: 'me',
+          requestBody: { raw: rawMessage }
+        });
+
+        // Update email status with thread ID for reply tracking
+        await pool.query(`
+          UPDATE outreach_emails
+          SET status = 'sent', sent_at = NOW(), gmail_message_id = $1, gmail_thread_id = $2
+          WHERE id = $3
+        `, [response.data.id, response.data.threadId, email.id]);
+
+        console.log(`Sent email ${email.id} to ${email.candidate_email}`);
+
+        // Rate limit: wait 2 seconds between sends
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      } catch (sendErr) {
+        console.error(`Failed to send email ${email.id}:`, sendErr.message);
+        await pool.query(`
+          UPDATE outreach_emails
+          SET status = 'failed', error_message = $1
+          WHERE id = $2
+        `, [sendErr.message, email.id]);
+      }
+    }
+  } catch (error) {
+    console.error('Outreach email job error:', error);
+  }
+});
+
+// Check for email replies and analyze sentiment (every 10 minutes)
+cron.schedule('*/10 * * * *', async () => {
+  console.log('Checking for outreach email replies...');
+  try {
+    // First, backfill missing thread IDs for sent emails
+    const missingThreads = await pool.query(`
+      SELECT e.id, e.gmail_message_id, r.notification_email AS recruiter_email
+      FROM outreach_emails e
+      JOIN outreach_candidates c ON c.id = e.candidate_id
+      JOIN roles r ON r.id::text = c.role_id
+      WHERE e.status = 'sent'
+        AND e.gmail_message_id IS NOT NULL
+        AND e.gmail_thread_id IS NULL
+    `);
+
+    for (const row of missingThreads.rows) {
+      try {
+        const gmail = await getGmailClient(row.recruiter_email);
+        const msg = await gmail.users.messages.get({ userId: 'me', id: row.gmail_message_id, format: 'minimal' });
+        if (msg.data.threadId) {
+          await pool.query('UPDATE outreach_emails SET gmail_thread_id = $1 WHERE id = $2', [msg.data.threadId, row.id]);
+          console.log(`Backfilled thread ID for email ${row.id}: ${msg.data.threadId}`);
+        }
+      } catch (err) {
+        console.error(`Failed to backfill thread ID for email ${row.id}:`, err.message);
+      }
+    }
+
+    // Get all sent emails with thread IDs where candidate is still active
+    const sentEmails = await pool.query(`
+      SELECT DISTINCT ON (e.gmail_thread_id)
+        e.id AS email_id, e.gmail_thread_id, e.gmail_message_id, e.candidate_id,
+        c.first_name, c.last_name, c.email AS candidate_email, c.status AS candidate_status,
+        c.role_id, r.notification_email AS recruiter_email, r.url_slug, r.company_name, r.job_title
+      FROM outreach_emails e
+      JOIN outreach_candidates c ON c.id = e.candidate_id
+      JOIN roles r ON r.id::text = c.role_id
+      WHERE e.status = 'sent'
+        AND e.gmail_thread_id IS NOT NULL
+        AND c.status = 'active'
+      ORDER BY e.gmail_thread_id, e.sequence_step DESC
+    `);
+
+    for (const email of sentEmails.rows) {
+      try {
+        const gmail = await getGmailClient(email.recruiter_email);
+
+        // Get thread messages
+        const thread = await gmail.users.threads.get({
+          userId: 'me',
+          id: email.gmail_thread_id,
+          format: 'full'
+        });
+
+        const messages = thread.data.messages || [];
+        if (messages.length <= 1) continue; // No replies yet
+
+        // Check if we already processed a reply for this candidate
+        const existingReply = await pool.query(
+          `SELECT id FROM outreach_responses WHERE candidate_id = $1 AND response_type = 'email_reply'`,
+          [email.candidate_id]
+        );
+        if (existingReply.rows.length > 0) continue;
+
+        // Find reply messages (not from the recruiter)
+        const replyMessages = messages.filter(msg => {
+          const fromHeader = msg.payload?.headers?.find(h => h.name.toLowerCase() === 'from')?.value || '';
+          return !fromHeader.toLowerCase().includes(email.recruiter_email.toLowerCase());
+        });
+
+        if (replyMessages.length === 0) continue;
+
+        // Extract reply text from the latest reply
+        const latestReply = replyMessages[replyMessages.length - 1];
+        let replyText = '';
+
+        function extractText(payload) {
+          if (payload.mimeType === 'text/plain' && payload.body?.data) {
+            return Buffer.from(payload.body.data, 'base64').toString('utf-8');
+          }
+          if (payload.parts) {
+            for (const part of payload.parts) {
+              const text = extractText(part);
+              if (text) return text;
+            }
+          }
+          return '';
+        }
+
+        replyText = extractText(latestReply.payload);
+        if (!replyText) continue;
+
+        // Clean up reply text (remove quoted previous messages)
+        const cleanReply = replyText.split(/\nOn .* wrote:\n/)[0]
+          .split(/\n>/).shift()
+          .trim();
+
+        if (!cleanReply) continue;
+
+        console.log(`Reply from ${email.candidate_email}: "${cleanReply.substring(0, 100)}..."`);
+
+        // Use Claude to analyze sentiment
+        const sentimentResult = await anthropic.messages.create({
+          model: 'claude-sonnet-4-5-20250929',
+          max_tokens: 200,
+          messages: [{
+            role: 'user',
+            content: `You are analyzing a candidate's reply to a recruiting outreach email for the role "${email.job_title}" at "${email.company_name}".
+
+The candidate (${email.first_name} ${email.last_name}) replied:
+"${cleanReply}"
+
+Classify the sentiment as exactly one of:
+- "interested" - they want to learn more, are open to chatting, positive response
+- "not_interested" - they decline, say no thanks, not looking, etc.
+- "maybe" - they're unsure, ask for more info without committing, or the response is ambiguous
+
+Respond with JSON only:
+{
+  "sentiment": "interested|not_interested|maybe",
+  "reason": "brief explanation of why this classification"
+}`
+          }]
+        });
+
+        const sentimentText = sentimentResult.content[0].text;
+        const cleanJson = sentimentText.replace(/```json|```/g, '').trim();
+        const parsed = JSON.parse(cleanJson);
+
+        console.log(`Sentiment for ${email.candidate_email}: ${parsed.sentiment} - ${parsed.reason}`);
+
+        // Record the reply
+        await pool.query(`
+          INSERT INTO outreach_responses (candidate_id, email_id, response_type, reply_text, sentiment)
+          VALUES ($1, $2, 'email_reply', $3, $4)
+        `, [email.candidate_id, email.email_id, cleanReply, parsed.sentiment]);
+
+        // Update candidate status based on sentiment
+        if (parsed.sentiment === 'interested') {
+          const screeningUrl = `${process.env.FRONTEND_URL}/screen/${email.url_slug}`;
+          await pool.query(`
+            UPDATE outreach_candidates
+            SET status = 'interested', interested_at = NOW(), screening_link = $1
+            WHERE id = $2
+          `, [screeningUrl, email.candidate_id]);
+        } else if (parsed.sentiment === 'not_interested') {
+          await pool.query(`
+            UPDATE outreach_candidates
+            SET status = 'not_interested', not_interested_at = NOW()
+            WHERE id = $1
+          `, [email.candidate_id]);
+        } else {
+          // "maybe" - mark as responded, keep in sequence
+          await pool.query(`
+            UPDATE outreach_candidates
+            SET status = 'responded', responded_at = NOW()
+            WHERE id = $1
+          `, [email.candidate_id]);
+        }
+
+        // Cancel pending emails for interested/not_interested
+        if (['interested', 'not_interested'].includes(parsed.sentiment)) {
+          await pool.query(`
+            UPDATE outreach_emails
+            SET status = 'cancelled'
+            WHERE candidate_id = $1 AND status = 'pending'
+          `, [email.candidate_id]);
+        }
+
+        // Wait a bit between API calls
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } catch (replyErr) {
+        console.error(`Error checking replies for email ${email.email_id}:`, replyErr.message);
+      }
+    }
+  } catch (error) {
+    console.error('Reply monitoring job error:', error);
+  }
+});
+
+// GDPR anonymization (daily at 2 AM)
+cron.schedule('0 2 * * *', async () => {
+  console.log('Running GDPR anonymization job...');
+  try {
+    // Find GDPR candidates with no response after 30 days from final email
+    const candidates = await pool.query(`
+      SELECT c.id, c.email, c.first_name, c.last_name
+      FROM outreach_candidates c
+      WHERE c.is_gdpr_country = TRUE
+        AND c.status = 'active'
+        AND EXISTS (
+          SELECT 1 FROM outreach_emails e
+          WHERE e.candidate_id = c.id
+            AND e.sequence_step = 3
+            AND e.sent_at < NOW() - INTERVAL '30 days'
+        )
+    `);
+
+    for (const candidate of candidates.rows) {
+      // Hash PII
+      const hashedEmail = crypto.createHash('sha256').update(candidate.email).digest('hex');
+      const hashedName = crypto.createHash('sha256').update(`${candidate.first_name} ${candidate.last_name}`).digest('hex');
+
+      await pool.query(`
+        UPDATE outreach_candidates
+        SET email = $1,
+            first_name = $2,
+            last_name = '',
+            status = 'gdpr_anonymized',
+            gdpr_anonymized_at = NOW()
+        WHERE id = $3
+      `, [`anon_${hashedEmail.substring(0, 16)}@gdpr.local`, `GDPR_${hashedName.substring(0, 8)}`, candidate.id]);
+
+      console.log(`Anonymized candidate ${candidate.id}`);
+    }
+  } catch (error) {
+    console.error('GDPR anonymization error:', error);
+  }
+});
+
+// ===== ADMIN ENDPOINTS =====
+
+// Middleware to check admin status
+function requireAdmin(req, res, next) {
+  if (!req.user.isAdmin) {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  next();
+}
+
+// List all users (admin only)
+app.get('/api/admin/users', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT id, email, is_admin, created_at
+      FROM users
+      ORDER BY created_at DESC
+    `);
+    res.json({ users: result.rows });
+  } catch (error) {
+    console.error('Error listing users:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update user admin status (admin only)
+app.patch('/api/admin/users/:id', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { isAdmin } = req.body;
+
+    if (typeof isAdmin !== 'boolean') {
+      return res.status(400).json({ error: 'isAdmin must be a boolean' });
+    }
+
+    const result = await pool.query(
+      'UPDATE users SET is_admin = $1 WHERE id = $2 RETURNING id, email, is_admin',
+      [isAdmin, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({ user: result.rows[0] });
+  } catch (error) {
+    console.error('Error updating user:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===================== LINKEDIN FREELANCER QUEUE =====================
+
+// Admin: Create a new freelancer queue with 10 candidates
+app.post('/api/admin/linkedin-queue', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const { roleId, freelancerName } = req.body;
+
+    if (!roleId || !freelancerName) {
+      return res.status(400).json({ error: 'Role ID and freelancer name are required' });
+    }
+
+    // Generate unique token
+    const token = crypto.randomBytes(16).toString('hex');
+
+    // Create the queue
+    const queueResult = await pool.query(
+      `INSERT INTO linkedin_freelancer_queue (token, role_id, name)
+       VALUES ($1, $2, $3)
+       RETURNING id, token, name, created_at, expires_at`,
+      [token, roleId, freelancerName]
+    );
+    const queue = queueResult.rows[0];
+
+    // Get 10 unassigned linkedin_only candidates for this role
+    const candidatesResult = await pool.query(
+      `SELECT c.id FROM outreach_candidates c
+       WHERE c.role_id = $1
+         AND c.status = 'linkedin_only'
+         AND c.id NOT IN (
+           SELECT candidate_id FROM linkedin_candidate_assignments
+         )
+       ORDER BY c.created_at
+       LIMIT 10`,
+      [roleId]
+    );
+
+    // Assign candidates to this queue
+    for (const candidate of candidatesResult.rows) {
+      await pool.query(
+        `INSERT INTO linkedin_candidate_assignments (queue_id, candidate_id)
+         VALUES ($1, $2)`,
+        [queue.id, candidate.id]
+      );
+    }
+
+    res.json({
+      queue: {
+        ...queue,
+        candidateCount: candidatesResult.rows.length,
+        link: `${req.protocol}://${req.get('host').replace(':3001', ':5173')}/linkedin-queue/${token}`
+      }
+    });
+  } catch (error) {
+    console.error('Error creating freelancer queue:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: Get all queues for a role
+app.get('/api/admin/linkedin-queue/:roleId', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const { roleId } = req.params;
+
+    const result = await pool.query(
+      `SELECT q.id, q.token, q.name, q.created_at, q.expires_at,
+              COUNT(a.id) as total_assigned,
+              COUNT(CASE WHEN a.status = 'interested' THEN 1 END) as interested_count,
+              COUNT(CASE WHEN a.status = 'not_interested' THEN 1 END) as not_interested_count,
+              COUNT(CASE WHEN a.status = 'contacted' THEN 1 END) as contacted_count,
+              COUNT(CASE WHEN a.status = 'pending' THEN 1 END) as pending_count
+       FROM linkedin_freelancer_queue q
+       LEFT JOIN linkedin_candidate_assignments a ON a.queue_id = q.id
+       WHERE q.role_id = $1
+       GROUP BY q.id
+       ORDER BY q.created_at DESC`,
+      [roleId]
+    );
+
+    res.json({ queues: result.rows });
+  } catch (error) {
+    console.error('Error getting queues:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: Delete a queue
+app.delete('/api/admin/linkedin-queue/:queueId', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const { queueId } = req.params;
+
+    await pool.query('DELETE FROM linkedin_candidate_assignments WHERE queue_id = $1', [queueId]);
+    await pool.query('DELETE FROM linkedin_freelancer_queue WHERE id = $1', [queueId]);
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error deleting queue:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Public: Get candidates for a freelancer queue
+app.get('/api/linkedin-queue/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+
+    // Get queue info
+    const queueResult = await pool.query(
+      `SELECT q.id, q.name, q.expires_at, r.job_title, r.company_name
+       FROM linkedin_freelancer_queue q
+       JOIN roles r ON r.id::text = q.role_id
+       WHERE q.token = $1`,
+      [token]
+    );
+
+    if (queueResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Queue not found' });
+    }
+
+    const queue = queueResult.rows[0];
+
+    // Check expiry
+    if (new Date(queue.expires_at) < new Date()) {
+      return res.status(410).json({ error: 'This link has expired' });
+    }
+
+    // Get assigned candidates
+    const candidatesResult = await pool.query(
+      `SELECT a.id as assignment_id, a.status as assignment_status, a.notes,
+              c.id, c.first_name, c.last_name, c.linkedin_url, c.current_job_title, c.current_employer, c.country
+       FROM linkedin_candidate_assignments a
+       JOIN outreach_candidates c ON c.id = a.candidate_id
+       WHERE a.queue_id = $1
+       ORDER BY a.assigned_at`,
+      [queue.id]
+    );
+
+    res.json({
+      queue: {
+        name: queue.name,
+        jobTitle: queue.job_title,
+        companyName: queue.company_name,
+        expiresAt: queue.expires_at
+      },
+      candidates: candidatesResult.rows
+    });
+  } catch (error) {
+    console.error('Error getting queue candidates:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Public: Update candidate status in a queue
+app.patch('/api/linkedin-queue/:token/candidates/:assignmentId', async (req, res) => {
+  try {
+    const { token, assignmentId } = req.params;
+    const { status, notes } = req.body;
+
+    // Verify token exists and not expired
+    const queueResult = await pool.query(
+      `SELECT q.id FROM linkedin_freelancer_queue q
+       JOIN linkedin_candidate_assignments a ON a.queue_id = q.id
+       WHERE q.token = $1 AND a.id = $2 AND q.expires_at > NOW()`,
+      [token, assignmentId]
+    );
+
+    if (queueResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Assignment not found or link expired' });
+    }
+
+    // Update assignment status
+    const updateResult = await pool.query(
+      `UPDATE linkedin_candidate_assignments
+       SET status = $1, notes = $2, updated_at = NOW()
+       WHERE id = $3
+       RETURNING *`,
+      [status, notes || null, assignmentId]
+    );
+
+    // Also update the main candidate status if interested/not interested
+    if (status === 'interested' || status === 'not_interested') {
+      const assignment = updateResult.rows[0];
+      await pool.query(
+        `UPDATE outreach_candidates
+         SET status = $1,
+             ${status === 'interested' ? 'interested_at' : 'not_interested_at'} = NOW()
+         WHERE id = $2`,
+        [status, assignment.candidate_id]
+      );
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error updating assignment:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: Create/invite new user
+app.post('/api/admin/users', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const { email, password, isAdmin = false } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    // Check if user already exists
+    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: 'User with this email already exists' });
+    }
+
+    const hashed = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      'INSERT INTO users (email, password, is_admin) VALUES ($1, $2, $3) RETURNING id, email, is_admin, created_at',
+      [email, hashed, isAdmin]
+    );
+
+    res.json({ user: result.rows[0] });
+  } catch (error) {
+    console.error('Error creating user:', error);
     res.status(500).json({ error: error.message });
   }
 });

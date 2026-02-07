@@ -43,8 +43,9 @@ function ScreeningForm() {
 
   const fetchRole = async () => {
     try {
-      const response = await fetch(`${import.meta.env.VITE_API_URL}/api/roles/${slug}`);
+      const response = await fetch(`${import.meta.env.VITE_API_URL}/api/roles/slug/${slug}`);
       const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Failed to load role');
       setRole(data);
 
       setFormData(prev => ({
@@ -55,7 +56,7 @@ function ScreeningForm() {
         }))
       }));
     } catch (error) {
-      alert('Error loading role');
+      alert(error.message || 'Error loading role');
     } finally {
       setLoading(false);
     }

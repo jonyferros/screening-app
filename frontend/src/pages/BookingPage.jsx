@@ -44,6 +44,8 @@ function BookingPage() {
     return d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
   };
 
+  const userTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
   const handleBook = async (e) => {
     e.preventDefault();
     setSubmitting(true);
@@ -108,7 +110,7 @@ function BookingPage() {
           <div className="bg-slate-50 border border-slate-200 rounded-xl px-6 py-5 text-left inline-block mb-6">
             {[
               { label: 'Date', value: formatDateLong(booking.booked_date) },
-              { label: 'Time', value: `${booking.booked_time} (15 min)` },
+              { label: 'Time', value: `${booking.booked_time} ${userTimezone} (15 min)` },
               { label: 'Role', value: `${role.job_title} at ${role.company_name}` }
             ].map(({ label, value }) => (
               <div key={label} className="mb-3 last:mb-0">
@@ -229,7 +231,8 @@ function BookingPage() {
 
             {/* Pick a time */}
             <div>
-              <label className="block text-sm font-semibold text-slate-700 mb-2.5">Pick a time</label>
+              <label className="block text-sm font-semibold text-slate-700 mb-1">Pick a time</label>
+              <p className="text-xs text-slate-400 mb-2.5">Times shown in {userTimezone}</p>
               <div className="flex gap-2 flex-wrap">
                 {timesForDate.map((t) => (
                   <button

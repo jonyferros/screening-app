@@ -67,7 +67,7 @@ function Screenings() {
   return (
     <div className="max-w-3xl mx-auto px-4 py-10">
       <div className="flex items-center justify-between mb-6">
-        <h1 className="text-2xl font-bold text-slate-800">My Screenings</h1>
+        <h1 className="text-2xl font-bold text-slate-800">My Projects</h1>
         <Link
           to="/create"
           className="px-4 py-2 bg-slate-900 text-white text-sm font-semibold rounded-lg hover:bg-slate-800 transition-colors"
@@ -98,13 +98,13 @@ function Screenings() {
 
       {filtered.length === 0 ? (
         <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-12 text-center">
-          <p className="text-slate-400 text-sm mb-4">No {filter} screenings.</p>
+          <p className="text-slate-400 text-sm mb-4">No {filter} projects.</p>
           {filter === 'open' && (
             <Link
               to="/create"
               className="inline-block px-5 py-2 bg-slate-900 text-white text-sm font-semibold rounded-lg hover:bg-slate-800 transition-colors"
             >
-              Create your first screening
+              Create your first project
             </Link>
           )}
         </div>
@@ -125,6 +125,9 @@ function Screenings() {
                   <h2 className="text-base font-semibold text-slate-800">{role.job_title}</h2>
                   <span className="text-slate-400 text-sm">—</span>
                   <span className="text-slate-500 text-sm">{role.company_name}</span>
+                  <span className="text-xs text-slate-400 font-mono bg-slate-100 px-1.5 py-0.5 rounded">
+                    {role.id.slice(0, 8)}
+                  </span>
                 </div>
 
                 <div className="flex items-center gap-3 mt-2 flex-wrap">
@@ -152,8 +155,10 @@ function Screenings() {
                   <button
                     type="button"
                     onClick={(e) => {
+                      e.preventDefault();
                       e.stopPropagation();
                       navigator.clipboard.writeText(`${window.location.origin}/book/${role.url_slug}`);
+                      alert('Calendar link copied to clipboard!');
                     }}
                     className="text-xs text-blue-600 hover:text-blue-700 underline text-left"
                   >
@@ -171,8 +176,15 @@ function Screenings() {
                 </div>
               </Link>
 
-              {/* Close/Reopen button */}
-              <div className="p-5 pl-0">
+              {/* Actions */}
+              <div className="p-5 pl-0 flex items-center gap-2">
+                <Link
+                  to={`/outreach/${role.id}`}
+                  onClick={(e) => e.stopPropagation()}
+                  className="flex-shrink-0 text-xs font-semibold px-3 py-1.5 rounded-lg border border-blue-300 text-blue-600 hover:bg-blue-50 transition-colors"
+                >
+                  Outreach
+                </Link>
                 <button
                   onClick={() => toggleStatus(role)}
                   className={`flex-shrink-0 text-xs font-semibold px-3 py-1.5 rounded-lg border transition-colors ${

@@ -29,7 +29,7 @@ function Login({ onLogin }) {
       localStorage.setItem('token', data.token);
       localStorage.setItem('email', data.email);
       localStorage.setItem('lastLogin', new Date().toISOString());
-      onLogin(data.email);
+      onLogin(data.email, data.isAdmin || false);
       navigate('/');
     } catch {
       setError('Network error — is the backend running?');
@@ -135,9 +135,8 @@ function Login({ onLogin }) {
             </button>
           </form>
 
-          <p className="text-center text-sm text-slate-500 mt-8">
-            Don't have an account?{' '}
-            <Link to="/register" className="text-sky-600 font-semibold hover:text-sky-700">Sign up</Link>
+          <p className="text-center text-sm text-slate-400 mt-8">
+            Contact your administrator for an account.
           </p>
         </div>
       </div>
